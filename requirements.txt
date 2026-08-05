@@ -1,0 +1,8 @@
+# SOC Nightshift Follow-up - required packages
+selenium>=4.15
+openpyxl>=3.1
+psutil>=5.9
+
+# Optional: only needed for "Undetected browser mode", which is for personal
+# outlook.com accounts that keep signing out. Not required at work.
+# seleniumbase>=4.51

@@ -1,0 +1,1390 @@
+#!/usr/bin/env python3
+"""SOC nightshift follow-up helper (core + command line).
+
+Drives Outlook on the web only - the SOC uses OWA, so there is no Outlook
+desktop/COM path to maintain.
+
+Reads case numbers from an XSOAR export (.csv or .xlsx), then drives Outlook
+on the web: for each case it searches  subject:SOC<num>  (and
+subject:"SOC <num>"  as a fallback), opens the newest matching mail, clicks
+Reply all, and waits for the analyst to review + send before moving on.
+Cases with no matching mail are flagged and written to a results CSV plus a
+highlighted copy of the input sheet.
+
+.xlsx input: rows hidden by an Excel filter are SKIPPED, so "filter, save,
+upload" processes only the visible rows. (CSV can't record filters - if you
+filter in Excel, save as .xlsx.)
+
+CLI usage:
+    python soc_followup.py --csv cases.xlsx
+    python soc_followup.py --csv cases.csv --parse-only
+GUI:
+    python soc_gui.py
+"""
+
+import argparse
+import csv
+import logging
+import platform
+import re
+import sys
+import time
+import traceback
+from datetime import datetime, timedelta
+from pathlib import Path
+
+try:  # selenium ships with seleniumbase; absent until deps are installed
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.common.keys import Keys
+except ImportError:
+    By = Keys = None
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+CASE_NUM_RE = re.compile(r"\d{5,8}")
+COLUMN_HINTS = ("case", "incident", "ticket", "id", "number")
+NO_RESULTS_RE = re.compile(
+    r"(couldn.t find|didn.t find|no results|nothing (?:that )?match)", re.I
+)
+
+# -------------------------------------------------------------------- logging
+
+log = logging.getLogger("soc_followup")
+LOG_PATH = None
+
+
+def setup_logging(verbose=False):
+    """Write a detailed log to logs\\followup_<timestamp>.log.
+
+    The analyst can send this file on when something goes wrong - it holds
+    the environment, every search tried, what matched, and full tracebacks.
+    """
+    global LOG_PATH
+    if LOG_PATH:
+        return LOG_PATH
+    logs = SCRIPT_DIR / "logs"
+    try:
+        logs.mkdir(exist_ok=True)
+    except Exception:
+        return None
+    LOG_PATH = logs / f"followup_{datetime.now():%Y%m%d_%H%M%S}.log"
+    handler = logging.FileHandler(LOG_PATH, encoding="utf-8")
+    handler.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)-7s %(message)s", "%H:%M:%S"))
+    log.setLevel(logging.DEBUG)
+    log.addHandler(handler)
+    if verbose:
+        stream = logging.StreamHandler()
+        stream.setFormatter(logging.Formatter("    [log] %(message)s"))
+        log.addHandler(stream)
+    log.info("=" * 60)
+    log.info("SOC nightshift follow-up - new run")
+    log.info("=" * 60)
+    for line in environment_report():
+        log.info(line)
+    return LOG_PATH
+
+
+def environment_report():
+    """Everything needed to reproduce a problem remotely."""
+    out = [f"tool folder   : {SCRIPT_DIR}",
+           f"python        : {sys.version.split()[0]} ({sys.executable})",
+           f"platform      : {platform.platform()}"]
+    for mod in ("selenium", "openpyxl", "psutil", "seleniumbase"):
+        try:
+            m = __import__(mod)
+            out.append(f"{mod:<14}: {getattr(m, '__version__', 'installed')}")
+        except ImportError:
+            out.append(f"{mod:<14}: not installed")
+    return out
+
+
+def log_exception(context, exc):
+    log.error("%s: %s: %s", context, type(exc).__name__, exc)
+    log.debug("traceback:\n%s", traceback.format_exc())
+
+
+def log_browser(driver):
+    """Chrome/driver versions and the window state, once at startup."""
+    try:
+        caps = getattr(driver, "capabilities", {}) or {}
+        log.info("chrome        : %s", caps.get("browserVersion", "?"))
+        chrome = caps.get("chrome", {}) or {}
+        log.info("chromedriver  : %s",
+                 str(chrome.get("chromedriverVersion", "?")).split(" ")[0])
+        log.info("window        : %s", driver.get_window_rect())
+        log.info("start url     : %s", driver.current_url)
+    except Exception as e:
+        log.debug("couldn't read browser info: %s", e)
+
+
+# ---------------------------------------------------------------- file input
+
+def read_csv_rows(path, stats=None):
+    """Read a .csv or .xlsx file into (headers, list-of-dict-rows).
+
+    For .xlsx, rows hidden by a filter are skipped (count reported via
+    stats["hidden_skipped"] if a dict is passed).
+    """
+    path = Path(str(path).strip().strip('"').strip("'"))
+    if path.suffix.lower() in (".xlsx", ".xlsm"):
+        try:
+            from openpyxl import load_workbook
+        except ImportError:
+            raise ValueError("reading .xlsx needs openpyxl - run: pip install openpyxl")
+        try:
+            ws = load_workbook(path, data_only=True).active
+        except PermissionError:
+            # open in Excel: work from a copy rather than making the analyst
+            # close their sheet
+            import shutil
+            import tempfile
+            tmp = Path(tempfile.gettempdir()) / f"_soc_followup_{path.name}"
+            shutil.copy2(path, tmp)
+            ws = load_workbook(tmp, data_only=True).active
+        hidden = 0
+        data, line_numbers = [], []
+        for idx, row in enumerate(ws.iter_rows(values_only=True), start=1):
+            if idx > 1 and idx in ws.row_dimensions and ws.row_dimensions[idx].hidden:
+                hidden += 1
+                continue
+            data.append([("" if c is None else str(c)) for c in row])
+            line_numbers.append(idx)   # the row number Excel shows
+        if stats is not None:
+            stats["hidden_skipped"] = hidden
+            stats["line_numbers"] = line_numbers[1:]   # drop the heading row
+        if not data:
+            return [], []
+        headers = data[0]
+        rows = [dict(zip(headers, r)) for r in data[1:]]
+        return headers, rows
+    try:
+        f = open(path, "r", encoding="utf-8-sig", newline="")
+    except PermissionError:
+        import shutil
+        import tempfile
+        tmp = Path(tempfile.gettempdir()) / f"_soc_followup_{path.name}"
+        shutil.copy2(path, tmp)
+        f = open(tmp, "r", encoding="utf-8-sig", newline="")
+    with f:
+        reader = csv.DictReader(f)
+        rows = [row for row in reader]
+        headers = reader.fieldnames or []
+    if stats is not None:
+        stats["hidden_skipped"] = 0
+        stats["line_numbers"] = list(range(2, len(rows) + 2))
+    return headers, rows
+
+
+def detect_case_column(headers, rows):
+    """Pick the column most likely to hold case numbers."""
+    best_col, best_score = None, 0.0
+    for col in headers:
+        if not col:
+            continue
+        values = [str(r.get(col, "") or "").strip() for r in rows]
+        values = [v for v in values if v]
+        if not values:
+            continue
+        hits = sum(1 for v in values if CASE_NUM_RE.search(v))
+        frac = hits / len(values)
+        named_like_a_case = any(h in col.lower() for h in COLUMN_HINTS)
+        bonus = 0.5 if named_like_a_case else 0.0
+        # A column called "Case ID" counts even if some rows are unparseable -
+        # a messy export shouldn't stop the tool dead. The rows it can't read
+        # are reported by preflight() rather than silently dropped.
+        threshold = 0.3 if named_like_a_case else 0.6
+        if frac >= threshold and frac + bonus > best_score:
+            best_col, best_score = col, frac + bonus
+    return best_col
+
+
+def extract_cases(path, column=None, stats=None):
+    """Returns (column_used, [case numbers as strings, deduped, in order])."""
+    headers, rows = read_csv_rows(path, stats)
+    if not headers:
+        raise ValueError(f"no header row found in {path}")
+    if column:
+        if column not in headers:
+            raise ValueError(
+                f"column '{column}' not in file. Available: {', '.join(headers)}"
+            )
+    else:
+        column = detect_case_column(headers, rows)
+        if not column:
+            raise ValueError(
+                "could not auto-detect the case-number column. "
+                f"Available columns: {', '.join(headers)}"
+            )
+    cases, seen = [], set()
+    unreadable, duplicates = [], []
+    # report the row numbers Excel shows, which skip over filtered-out rows
+    line_numbers = (stats or {}).get("line_numbers") or \
+        list(range(2, len(rows) + 2))
+    for i, row in zip(line_numbers, rows):
+        raw = str(row.get(column) or "").strip()
+        m = CASE_NUM_RE.search(raw)
+        if not m:
+            if raw:                             # blank rows aren't a problem
+                unreadable.append((i, raw[:40]))
+            continue
+        if m.group(0) in seen:
+            duplicates.append((i, m.group(0)))
+            continue
+        seen.add(m.group(0))
+        cases.append(m.group(0))
+    if stats is not None:
+        stats["rows_read"] = len(rows)
+        stats["unreadable"] = unreadable        # rows that hold no case number
+        stats["duplicates"] = duplicates
+    return column, cases
+
+
+def preflight(path, column=None):
+    """Dry-run an export: what will be processed, and what will be ignored.
+    Nothing touches Outlook - use before a shift to sanity-check a new export.
+    """
+    stats = {}
+    col, cases = extract_cases(path, column, stats)
+    headers, _ = read_csv_rows(path)
+    # An export with no header row would have its first case number read as a
+    # column name - i.e. one case silently missing from the whole run.
+    header_is_data = [str(h) for h in headers
+                      if h and CASE_NUM_RE.search(str(h))]
+    return {
+        "column": col,
+        "columns": headers,
+        "cases": cases,
+        "rows_read": stats.get("rows_read", 0),
+        "hidden_skipped": stats.get("hidden_skipped", 0),
+        "unreadable": stats.get("unreadable", []),
+        "duplicates": stats.get("duplicates", []),
+        "header_is_data": header_is_data,
+    }
+
+
+def format_preflight(report):
+    out = [f"Case-number column : '{report['column']}'",
+           f"Columns in file    : {', '.join(str(c) for c in report['columns'])}",
+           f"Rows read          : {report['rows_read']}"]
+    if report["hidden_skipped"]:
+        out.append(f"Filtered out (Excel): {report['hidden_skipped']} row(s) skipped")
+    out.append(f"Cases to process   : {len(report['cases'])}")
+    if report["duplicates"]:
+        out.append(f"Duplicates ignored : {len(report['duplicates'])} "
+                   f"(e.g. row {report['duplicates'][0][0]}: "
+                   f"{report['duplicates'][0][1]})")
+    if report["unreadable"]:
+        out.append(f"!! NO CASE NUMBER FOUND in {len(report['unreadable'])} row(s) "
+                   "- these will be IGNORED:")
+        for line, raw in report["unreadable"][:10]:
+            out.append(f"     row {line}: {raw!r}")
+        if len(report["unreadable"]) > 10:
+            out.append(f"     ... and {len(report['unreadable']) - 10} more")
+        out.append("   (case numbers must be 5-8 digits; tell me the real "
+                   "format if yours differ)")
+    if report.get("header_is_data"):
+        out.append("!! The first row looks like DATA, not column headings "
+                   f"({', '.join(report['header_is_data'][:3])}).")
+        out.append("   Row 1 is always treated as headings, so that case would "
+                   "be missed - add a heading row to the export.")
+    sample = ", ".join(f"SOC{c}" for c in report["cases"][:6])
+    if sample:
+        out.append(f"First few          : {sample}")
+    return "\n".join(out)
+
+# --------------------------------------------------------------- UI plumbing
+
+class ConsoleUI:
+    """Terminal front-end: log() prints, ask() uses input()."""
+
+    def log(self, msg):
+        print(msg)
+
+    def ask(self, prompt, choices, kind=None):
+        while True:
+            ans = input(prompt).strip().lower()
+            if ans in choices:
+                return ans
+            print("    Unrecognised option.")
+
+    def case_update(self, num, status, detail=""):
+        pass  # GUIs use this to move cases through their tracker table
+
+    def ask_or_watch(self, prompt, choices, watch_fn, poll_s=0.7, kind=None):
+        """Like ask(), but also auto-returns 'auto' once watch_fn() is True
+        (e.g. the reply draft was sent). Falls back to blocking ask() if
+        single-key console input isn't available."""
+        print(prompt + " (auto-continues once the draft is sent)")
+        try:
+            import msvcrt
+        except ImportError:
+            return self.ask(prompt, choices)
+        while True:
+            if watch_fn():
+                print("    Send detected - continuing.")
+                return "auto"
+            t = time.time() + poll_s
+            while time.time() < t:
+                if msvcrt.kbhit():
+                    ch = msvcrt.getwch()
+                    if ch in ("\r", "\n"):
+                        return ""
+                    if ch.lower() in choices:
+                        return ch.lower()
+                time.sleep(0.05)
+
+
+def _ask_with_watch(ui, prompt, choices, watch_fn, kind=None):
+    fn = getattr(ui, "ask_or_watch", None)
+    if fn and watch_fn:
+        return fn(prompt, choices, watch_fn, kind=kind)
+    return ui.ask(prompt, choices, kind=kind)
+
+
+def _notify(ui, num, status, detail=""):
+    log.info("case %s -> %s %s", num, status, f"({detail})" if detail else "")
+    fn = getattr(ui, "case_update", None)
+    if fn:
+        try:
+            fn(num, status, detail)
+        except Exception:
+            pass
+
+# ------------------------------------------------------------- Outlook (OWA)
+
+def _find_first(driver, css_list):
+    """First displayed element matching any of the CSS selectors, else None."""
+    for css in css_list:
+        try:
+            els = driver.find_elements(By.CSS_SELECTOR, css)
+        except Exception:
+            continue
+        for el in els:
+            try:
+                if el.is_displayed():
+                    return el
+            except Exception:
+                continue
+    return None
+
+
+def get_search_box(driver):
+    return _find_first(driver, [
+        "#topSearchInput",
+        "input[role='searchbox']",
+        "[role='searchbox']",
+        "input[aria-label*='Search' i]",
+        "input[placeholder*='Search' i]",
+    ])
+
+
+def wait_for_mailbox(page, timeout_s):
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        box = get_search_box(page)
+        if box is not None:
+            return box
+        time.sleep(2)
+    return None
+
+
+def build_queries(num):
+    """Search terms to try, in order, for one case number.
+
+    Spacing matters, case does not - both proven live on 2026-08-04:
+    "SOC610454" found nothing while "SOC 610454" matched, and "SOC610529"
+    (uppercase) matched a mail whose subject is lowercase "soc610529". So
+    both spacings are tried, but lowercase duplicates are not - they would
+    only slow down cases that have no mail at all. The subject: operator is
+    last; it matched nothing live.
+    """
+    return [
+        f"SOC{num}",            # SOC610529  - the usual SOC format
+        f"SOC {num}",           # SOC 610529 - and every punctuated form:
+                                # proven live that this also finds
+                                # [SOC#610529] and SOC-610529, because
+                                # Outlook splits words on punctuation
+        str(num),               # 610529     - bare number
+        f"subject:SOC{num}",
+        f'subject:"SOC {num}"',
+    ]
+
+
+_TIME_RE = re.compile(r"(\d{1,2}):(\d{2})\s*([AP])\.?M\.?", re.I)
+_FULLDATE_RE = re.compile(r"\b(\d{1,2})/(\d{1,2})/(\d{2,4})\b")
+_SHORTDATE_RE = re.compile(r"\b(\d{1,2})/(\d{1,2})\b")
+_WEEKDAY_RE = re.compile(r"\b(Mon|Tue|Wed|Thu|Fri|Sat|Sun)\w*\b", re.I)
+_WEEKDAYS = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
+
+
+def parse_row_time(label, now=None):
+    """Best-effort timestamp from an Outlook row label.
+
+    Handles the formats OWA actually shows: '7:34 PM' (today),
+    'Mon 3:12 PM' (this week), 'Sat 7/11' (this year), '7/4/2026'.
+    Returns None when nothing parseable is present.
+    """
+    if not label:
+        return None
+    now = now or datetime.now()
+    hour = minute = None
+    t = _TIME_RE.search(label)
+    if t:
+        hour = int(t.group(1)) % 12
+        if t.group(3).upper() == "P":
+            hour += 12
+        minute = int(t.group(2))
+
+    m = _FULLDATE_RE.search(label)
+    if m:
+        mo, d, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if y < 100:
+            y += 2000
+        try:
+            base = datetime(y, mo, d)
+        except ValueError:
+            return None
+        return base.replace(hour=hour or 0, minute=minute or 0)
+
+    m = _SHORTDATE_RE.search(label)
+    if m:
+        mo, d = int(m.group(1)), int(m.group(2))
+        for year in (now.year, now.year - 1):
+            try:
+                base = datetime(year, mo, d, hour or 0, minute or 0)
+            except ValueError:
+                return None
+            if base <= now + timedelta(days=1):
+                return base
+        return None
+
+    if hour is None:
+        return None
+
+    wd = _WEEKDAY_RE.search(label)
+    day = now
+    if wd:
+        target = _WEEKDAYS[wd.group(1)[:3].lower()]
+        day = now - timedelta(days=(now.weekday() - target) % 7)
+    return day.replace(hour=hour, minute=minute, second=0, microsecond=0)
+
+
+def sort_newest_first(items, now=None):
+    """Order result rows newest-first by their displayed timestamp.
+    Rows with no parseable time keep their original order, after the rest."""
+    now = now or datetime.now()
+    decorated = []
+    for i, el in enumerate(items):
+        ts = parse_row_time(label_of(el), now)
+        decorated.append((0 if ts else 1, -ts.timestamp() if ts else i, i, el))
+    decorated.sort(key=lambda d: d[:3])
+    return [d[3] for d in decorated]
+
+
+# The search box's autocomplete dropdown uses the same listbox/option roles
+# as the message list, so a bare "[role='option']" also matches suggestions -
+# clicking one runs a search instead of opening mail. Prefer the message list.
+MESSAGE_LIST_SELECTORS = [
+    "div[aria-label='Message list'] div[role='option']",
+    "[aria-label*='Message list' i] [role='option']",
+    "[data-app-section='MessageList'] [role='option']",
+    "[role='listbox'][aria-label*='essage'] [role='option']",
+    "div[role='listbox'] div[role='option'][data-convid]",
+    "[role='listbox'] [role='option']",  # last resort
+]
+
+
+def _visible_results(page):
+    last = len(MESSAGE_LIST_SELECTORS) - 1
+    for i, css in enumerate(MESSAGE_LIST_SELECTORS):
+        try:
+            found = [e for e in page.find_elements(By.CSS_SELECTOR, css)
+                     if e.is_displayed()]
+        except Exception:
+            continue
+        if i == last:
+            # Generic selector: also matches autocomplete suggestions. Every
+            # real mail row shows a date/time, suggestions don't - so require
+            # one rather than risk clicking a suggestion.
+            found = [e for e in found if parse_row_time(label_of(e)) is not None]
+        if found:
+            return found
+    return []
+
+
+def _dismiss_suggestions(page):
+    """Close the search autocomplete popup so it can't be mistaken for
+    results (and can't swallow the next click)."""
+    try:
+        popup = page.find_elements(
+            By.CSS_SELECTOR, "[role='listbox'][aria-label*='uggest' i], "
+                             "[role='listbox'] [role='option'][id*='uggest']")
+        if any(e.is_displayed() for e in popup):
+            page.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
+            time.sleep(0.4)
+    except Exception:
+        pass
+
+
+def label_matches_case(label, num):
+    """True only if `num` appears as a whole number in `label`.
+
+    A plain substring test would make case 610529 match a mail about
+    SOC1610529 - a different case entirely - so digits either side
+    disqualify the match.
+    """
+    if not label:
+        return False
+    return re.search(rf"(?<!\d){re.escape(str(num))}(?!\d)", label) is not None
+
+
+def label_of(el):
+    try:
+        return " ".join(((el.get_attribute("aria-label") or el.text) or "").split())
+    except Exception:
+        return ""
+
+
+def run_search(page, query, settle_s, num=None):
+    """Search OWA and return the visible result elements, or None.
+
+    When num is given, only results whose row text actually contains that
+    case number count as a match - so a search that silently returned the
+    whole inbox doesn't get mistaken for a hit.
+    """
+    box = get_search_box(page)
+    if box is None:
+        raise RuntimeError("search box not found - are you logged in?")
+    try:
+        box.click()
+    except Exception:
+        pass
+    box = get_search_box(page) or box  # OWA can swap the input once focused
+    try:
+        box.send_keys(Keys.CONTROL, "a")
+        box.send_keys(Keys.DELETE)
+    except Exception:
+        pass
+    for ch in query:  # human-ish typing pace
+        box.send_keys(ch)
+        time.sleep(0.03)
+    time.sleep(0.4)       # let autocomplete settle so Enter submits what we typed
+    box.send_keys(Keys.ENTER)
+    time.sleep(settle_s)  # let the result list replace the inbox list
+    _dismiss_suggestions(page)
+
+    deadline = time.time() + 12
+    misses = 0
+    while time.time() < deadline:
+        items = _visible_results(page)
+        if items:
+            if num is None:
+                return items
+            hits = [e for e in items if label_matches_case(label_of(e), num)]
+            if hits:
+                log.info("search %r -> %d row(s), %d match case %s",
+                         query, len(items), len(hits), num)
+                log.debug("  matched rows: %s",
+                          [label_of(e)[:90] for e in hits[:3]])
+                return hits
+            misses += 1
+            if misses >= 3:  # results are showing, none are this case
+                log.info("search %r -> %d row(s), none contain %s",
+                         query, len(items), num)
+                log.debug("  rows shown: %s",
+                          [label_of(e)[:90] for e in items[:3]])
+                return None
+        else:
+            try:
+                body = page.find_element(By.TAG_NAME, "body").text
+                if NO_RESULTS_RE.search(body or ""):
+                    log.info("search %r -> Outlook reports no results", query)
+                    return None
+            except Exception:
+                pass
+        time.sleep(0.6)
+    log.info("search %r -> nothing appeared within the timeout", query)
+    return None
+
+
+def _click_el(el):
+    if el is None:
+        return False
+    try:
+        if not el.is_enabled():
+            return False
+        el.click()
+        return True
+    except Exception:
+        return False
+
+
+def _find_by_text(page, text, roles=("menuitem", "button", "menuitemcheckbox")):
+    """Visible element with one of these ARIA roles whose text is exactly
+    `text` (used for menu entries that carry no aria-label)."""
+    parts = [f"//*[@role='{r}'][normalize-space(.)='{text}']" for r in roles]
+    parts.append(f"//button[normalize-space(.)='{text}']")
+    try:
+        for el in page.find_elements(By.XPATH, " | ".join(parts)):
+            if el.is_displayed():
+                return el
+    except Exception:
+        pass
+    return None
+
+
+def click_reply_all(page):
+    """Click Reply all - toolbar button first, then the '...' overflow menu.
+
+    On narrow windows OWA hides Reply all behind the '...' (More actions)
+    button next to the message header, so the direct button isn't there.
+    """
+    direct = _find_first(page, [
+        "button[aria-label='Reply all']",
+        "[aria-label='Reply all']",
+        "button[title='Reply all']",
+        "[aria-label*='Reply all']",
+    ])
+    if _click_el(direct):
+        return True
+
+    more = _find_first(page, [
+        "button[aria-label='More options']",
+        "button[aria-label='More actions']",
+        "button[aria-label='More commands']",
+        "[aria-label='More options']",
+        "[aria-label*='More actions' i]",
+        "[data-testid='ThreeDotButton']",
+    ])
+    if not _click_el(more):
+        return False
+    time.sleep(0.8)
+
+    if _click_el(_find_by_text(page, "Reply all")):
+        return True
+    if _click_el(_find_first(page, ["[aria-label='Reply all']"])):
+        return True
+
+    # some builds tuck it under "Other reply actions"
+    other = _find_by_text(page, "Other reply actions")
+    if _click_el(other):
+        time.sleep(0.8)
+        if _click_el(_find_by_text(page, "Reply all")):
+            return True
+    try:  # leave no menu hanging open for the next case
+        page.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
+    except Exception:
+        pass
+    return False
+
+
+def wait_for_reading_pane(page, timeout=12):
+    """True once the clicked mail is actually open (its Reply/Forward/'...'
+    controls are showing) - guards against clicking a non-mail element."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if _find_first(page, [
+            "button[aria-label='Reply all']",
+            "button[aria-label='Reply']",
+            "[aria-label='Forward']",
+            "button[aria-label='More options']",
+            "button[aria-label='More actions']",
+        ]) is not None:
+            return True
+        if _find_by_text(page, "Forward") is not None:
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def compose_is_open(page):
+    el = _find_first(page, [
+        "button[aria-label='Send']",
+        "button[aria-label^='Send (']",
+        "button[title^='Send']",
+    ])
+    return el is not None
+
+
+def _ensure_mailbox(page, opts, ui):
+    """Make sure the mailbox (search box) is reachable. If the session was
+    signed out, pause and wait for the analyst to sign back in."""
+    if get_search_box(page) is not None:
+        return True
+    try:
+        page.get(opts.url)
+    except Exception:
+        pass
+    if wait_for_mailbox(page, 15) is not None:
+        return True
+    log.warning("mailbox not reachable - waiting for the analyst to sign in")
+    try:
+        log.info("  current url: %s", page.current_url)
+    except Exception:
+        pass
+    ui.log("    Signed out? Sign in again in the automated browser window "
+           "(choose 'Yes' at 'Stay signed in?'). Waiting up to 5 minutes...")
+    ok = wait_for_mailbox(page, 300) is not None
+    log.info("  signed back in: %s", ok)
+    return ok
+
+
+def _click_folder(page, name):
+    """Click a folder (e.g. 'Sent Items', 'Inbox') in the OWA left nav."""
+    el = _find_first(page, [
+        f"[role='treeitem'][title='{name}']",
+        f"[title='{name}']",
+    ])
+    if el is None:
+        try:
+            els = page.find_elements(By.XPATH, f"//span[text()='{name}']")
+            el = next((e for e in els if e.is_displayed()), None)
+        except Exception:
+            el = None
+    if el is not None:
+        try:
+            el.click()
+            time.sleep(1.5)
+            return True
+        except Exception:
+            return False
+    return False
+
+
+def verify_sent_web(page, num, ui):
+    """After the draft closed, look for the reply in Sent Items.
+    True = found, False = definitely not there, None = couldn't check."""
+    if not _click_folder(page, "Sent Items"):
+        return None
+    try:
+        for _attempt in range(3):
+            # must use the scoped lookup: the raw listbox selector also
+            # matches leftover search suggestions, which would "verify" a
+            # reply that was never sent
+            for it in _visible_results(page)[:6]:
+                if label_matches_case(label_of(it), num):
+                    return True
+            time.sleep(1.5)  # a just-sent mail can take a moment to appear
+        return False
+    except Exception:
+        return None
+    finally:
+        _click_folder(page, "Inbox")
+
+
+def make_sent_watcher(page):
+    """True once a compose pane was seen open and has since closed (sent or
+    discarded). Two consecutive 'closed' polls guard against UI re-renders."""
+    state = {"seen_open": False, "closed": 0}
+
+    def watch():
+        if compose_is_open(page):
+            state["seen_open"] = True
+            state["closed"] = 0
+            return False
+        if not state["seen_open"]:
+            return False
+        state["closed"] += 1
+        return state["closed"] >= 2
+
+    return watch
+
+
+def screenshot(page, shots_dir, name):
+    try:
+        shots_dir.mkdir(exist_ok=True)
+        path = shots_dir / f"{name}_{datetime.now():%H%M%S}.png"
+        page.save_screenshot(str(path))
+        return path
+    except Exception:
+        return None
+
+
+# Row colours in the review sheet: done vs still needs a human.
+STATUS_STYLE = {
+    "SENT":       ("Replied",        "C6EFCE"),   # green
+    "SKIPPED":    ("Skipped",        "FFEB9C"),   # amber
+    "NOT_FOUND":  ("NOT FOUND",      "FFC7CE"),   # red
+    "ERROR":      ("ERROR",          "FFC7CE"),   # red
+    "QUIT":       ("Stopped",        "E7E6E6"),   # grey
+    "PENDING":    ("Not done yet",   "FFF2CC"),   # pale yellow
+}
+
+
+def write_status_xlsx(src_path, column, status_by_case, out_path):
+    """Copy the input sheet, add a status column and colour every row:
+    green = replied, red = still needs a human, yellow = not done yet."""
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, PatternFill
+    except ImportError:
+        return None
+    headers, rows = read_csv_rows(src_path)
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "follow-up"
+    ws.append(list(headers) + ["Follow-up status"])
+    for cell in ws[1]:
+        cell.font = Font(bold=True)
+
+    for row in rows:
+        ws.append([row.get(h, "") for h in headers])
+        m = CASE_NUM_RE.search(str(row.get(column) or ""))
+        status = status_by_case.get(m.group(0), "PENDING") if m else "PENDING"
+        text, colour = STATUS_STYLE.get(status, STATUS_STYLE["PENDING"])
+        ws.cell(row=ws.max_row, column=len(headers) + 1, value=text)
+        fill = PatternFill(start_color=colour, end_color=colour, fill_type="solid")
+        for cell in ws[ws.max_row]:
+            cell.fill = fill
+
+    widths = [max(10, min(44, len(str(h)) + 4)) for h in headers] + [18]
+    for i, w in enumerate(widths, start=1):
+        ws.column_dimensions[ws.cell(row=1, column=i).column_letter].width = w
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = f"A1:{ws.cell(row=1, column=len(headers) + 1).column_letter}" \
+                         f"{ws.max_row}"
+    wb.save(out_path)
+    return out_path
+
+# ------------------------------------------------------------------ main flow
+
+def process_case(page, num, opts, shots_dir, ui):
+    """Returns (status, detail). Statuses: SENT, SKIPPED, NOT_FOUND, QUIT, ERROR."""
+    if not _ensure_mailbox(page, opts, ui):
+        return "ERROR", "mailbox not reachable - sign in, then use Retry"
+
+    queries = build_queries(num)
+    items, used_query = None, None
+    for q in queries:
+        try:
+            items = run_search(page, q, opts.settle, num=num)
+        except RuntimeError:
+            if not _ensure_mailbox(page, opts, ui):
+                return "ERROR", "signed out - sign in, then use Retry"
+            items = run_search(page, q, opts.settle, num=num)
+        if items:
+            used_query = q
+            break
+        ui.log(f"    no match for: {q}")
+
+    if not items:
+        shot = screenshot(page, shots_dir, f"case_{num}_notfound")
+        log.warning("case %s NOT FOUND after %d searches; screenshot: %s",
+                    num, len(queries), shot)
+        try:
+            log.debug("  page url at failure: %s", page.current_url)
+        except Exception:
+            pass
+        return "NOT_FOUND", f"no mail matched (tried {len(queries)} searches)"
+
+    try:
+        count = len(items)
+        ordered = sort_newest_first(items)
+        first = ordered[0]
+        label = label_of(first)[:120]
+        if count > 1:
+            ui.log(f"    {count} results - replying to the most recent one.")
+        log.info("opening: %s", label)
+        first.click()
+        time.sleep(1.0)
+        if not wait_for_reading_pane(page):
+            shot = screenshot(page, shots_dir, f"case_{num}_not_opened")
+            log.error("clicked a result but no reading pane appeared; "
+                      "screenshot: %s", shot)
+            return "ERROR", "clicked the result but no mail opened"
+    except Exception as e:
+        shot = screenshot(page, shots_dir, f"case_{num}_open_fail")
+        log_exception(f"case {num}: opening the result (screenshot {shot})", e)
+        return "ERROR", f"could not open result: {e}"
+
+    if not click_reply_all(page):
+        shot = screenshot(page, shots_dir, f"case_{num}_replyall_fail")
+        log.error("Reply all not found (toolbar or ... menu); screenshot: %s",
+                  shot)
+        return "ERROR", "Reply all button not found (screenshot saved)"
+    log.info("reply-all draft opened; compose detected: %s",
+             compose_is_open(page))
+
+    time.sleep(1.0)
+    if not compose_is_open(page):
+        ui.log("    (couldn't confirm the draft opened - check the browser)")
+
+    ui.log(f"    Match ({count} result(s), query {used_query}):")
+    if label:
+        ui.log(f"    {label}")
+    ui.log("    Reply-all draft is open in the browser. Review, edit, hit Send.")
+    _notify(ui, num, "REVIEW", label)
+    choice = _ask_with_watch(
+        ui,
+        "    [Enter]=sent, next case | s=skip | r=retry this case | q=quit > ",
+        ("", "s", "r", "q"),
+        make_sent_watcher(page),
+        kind="review",
+    )
+    if choice == "s":
+        return "SKIPPED", label
+    if choice == "r":
+        return process_case(page, num, opts, shots_dir, ui)
+    if choice == "q":
+        return "QUIT", ""
+
+    # draft closed (auto-detected) or analyst said sent - verify in Sent Items
+    if choice == "auto":
+        ui.log("    Draft closed - checking Sent Items...")
+    else:
+        ui.log("    Checking Sent Items...")
+    ok = verify_sent_web(page, num, ui)
+    log.info("sent-items check for %s -> %s", num,
+             {True: "found", False: "not found", None: "could not check"}[ok])
+    if ok is True:
+        ui.log("    Verified in Sent Items.")
+        return "SENT", label
+    if ok is None:
+        return "SENT", label + " (send not verified)"
+    ui.log("    !!! Nothing matching in Sent Items.")
+    c2 = ui.ask(
+        "    Draft closed but I can't find it in Sent Items - was it sent? "
+        "[Enter]=yes | s=no, mark skipped | r=retry this case > ",
+        ("", "s", "r"),
+        kind="verify",
+    )
+    if c2 == "s":
+        return "SKIPPED", label + " (draft closed without sending)"
+    if c2 == "r":
+        return process_case(page, num, opts, shots_dir, ui)
+    return "SENT", label
+
+
+def list_monitors():
+    """Attached monitors as [{index, x, y, w, h, primary}], left-to-right.
+
+    Uses Win32 EnumDisplayMonitors so no extra package is needed. Returns []
+    if the call isn't available (non-Windows, or an odd display driver).
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except Exception:
+        return []
+    found = []
+    try:
+        proc = ctypes.WINFUNCTYPE(
+            ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong,
+            ctypes.POINTER(wintypes.RECT), wintypes.LPARAM)
+
+        def _cb(_hmon, _hdc, lprect, _data):
+            r = lprect.contents
+            found.append({"x": r.left, "y": r.top,
+                          "w": r.right - r.left, "h": r.bottom - r.top})
+            return 1
+
+        ctypes.windll.user32.EnumDisplayMonitors(0, 0, proc(_cb), 0)
+    except Exception:
+        return []
+    found.sort(key=lambda m: (m["x"], m["y"]))
+    for i, m in enumerate(found, 1):
+        m["index"] = i
+        m["primary"] = (m["x"] == 0 and m["y"] == 0)
+    return found
+
+
+def describe_monitors():
+    mons = list_monitors()
+    return [f"Monitor {m['index']}: {m['w']}x{m['h']}"
+            + (" (primary)" if m["primary"] else "") for m in mons]
+
+
+def place_window(driver, choice="largest", ui=None):
+    """Move the browser to the chosen monitor and maximise it there.
+
+    Full width matters: on a narrow window OWA hides Reply all behind the
+    '...' menu, so analysts shouldn't have to resize anything themselves.
+    choice: 'largest' | 'primary' | monitor number (1-based) | 'current'
+    """
+    mons = list_monitors()
+    target = None
+    if mons and str(choice) != "current":
+        if str(choice).isdigit():
+            target = next((m for m in mons if m["index"] == int(choice)), None)
+        elif choice == "primary":
+            target = next((m for m in mons if m["primary"]), None)
+        if target is None:  # 'largest' or a bad choice
+            target = max(mons, key=lambda m: m["w"] * m["h"])
+    try:
+        if target:
+            # nudge inside the target monitor first, so maximise picks it
+            driver.set_window_rect(x=target["x"] + 40, y=target["y"] + 40,
+                                   width=min(1400, target["w"] - 80),
+                                   height=min(900, target["h"] - 120))
+            time.sleep(0.4)
+        driver.maximize_window()
+        time.sleep(0.4)
+        size = driver.get_window_size()
+        if target and size.get("width", 0) < target["w"] * 0.8:
+            # maximise didn't take - set the rect explicitly
+            driver.set_window_rect(x=target["x"], y=target["y"],
+                                   width=target["w"], height=target["h"] - 40)
+            size = driver.get_window_size()
+        if ui:
+            where = f" on monitor {target['index']}" if target else ""
+            ui.log(f"Browser window: {size.get('width')}x{size.get('height')}{where}")
+        return size
+    except Exception as e:
+        if ui:
+            ui.log(f"(couldn't position the window: {e})")
+        return None
+
+
+def _release_stale_profile(profile_dir, ui=None):
+    """Close leftover Chrome/driver processes still holding OUR profile.
+
+    Chrome refuses to reuse a profile another process owns and quietly
+    starts a blank one instead - which looks like being signed out. Only
+    processes whose command line names this profile directory are touched,
+    so the analyst's own Chrome is never disturbed.
+    """
+    try:
+        import psutil
+    except ImportError:
+        return 0
+    target = str(Path(profile_dir).resolve()).lower()
+    victims = []
+    for proc in psutil.process_iter(["name", "cmdline"]):
+        name = (proc.info.get("name") or "").lower()
+        if not any(n in name for n in ("chrome", "chromedriver", "uc_driver")):
+            continue
+        cmdline = " ".join(proc.info.get("cmdline") or []).lower()
+        if target and target in cmdline:
+            victims.append(proc)
+    if not victims:
+        return 0
+    if ui:
+        ui.log(f"Closing {len(victims)} leftover browser process(es) from a "
+               "previous run...")
+    for proc in victims:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+    gone, alive = psutil.wait_procs(victims, timeout=8)
+    for proc in alive:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    lock = Path(profile_dir) / "lockfile"
+    try:
+        if lock.exists():
+            lock.unlink()
+    except Exception:
+        pass
+    time.sleep(1.0)  # let Chrome flush the cookie DB before relaunching
+    return len(victims)
+
+
+def _launch_browser(opts, ui=None):
+    """Start Chrome with a persistent profile.
+
+    Plain Selenium WebDriver by default: ordinary, visible browser
+    automation, which is what gets signed off in a managed environment.
+    engine='stealth' swaps in SeleniumBase's undetected mode - only needed
+    for personal outlook.com accounts, whose risk engine revokes sessions it
+    can tell are automated.
+    """
+    profile_dir = Path(opts.profile_dir)
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    _release_stale_profile(profile_dir, ui)
+    engine = getattr(opts, "engine", "standard")
+
+    if engine == "stealth":
+        try:
+            from seleniumbase import Driver
+        except ImportError:
+            raise RuntimeError("stealth mode needs seleniumbase - run: "
+                               "pip install seleniumbase (not needed for "
+                               "normal use)")
+        driver = Driver(uc=True, headless=False, user_data_dir=str(profile_dir))
+    else:
+        try:
+            from selenium import webdriver
+            from selenium.webdriver.chrome.options import Options
+            from selenium.webdriver.chrome.service import Service
+        except ImportError:
+            raise RuntimeError("selenium is not installed - run: "
+                               "pip install selenium")
+        options = Options()
+        options.add_argument(f"--user-data-dir={profile_dir}")
+        options.add_argument("--start-maximized")
+        # If the environment blocks driver downloads, drop a matching
+        # chromedriver.exe beside this script and it gets used instead.
+        local_driver = SCRIPT_DIR / "chromedriver.exe"
+        service = (Service(executable_path=str(local_driver))
+                   if local_driver.exists() else Service())
+        driver = webdriver.Chrome(options=options, service=service)
+
+    if ui:
+        ui.log("Browser: Chrome ("
+               + ("undetected mode" if engine == "stealth"
+                  else "standard Selenium") + ")")
+    place_window(driver, getattr(opts, "monitor", "largest"), ui)
+    return driver
+
+
+def _case_loop(cases, opts, ui, run_one, on_error=None):
+    """Shared per-case loop: bookkeeping, not-found pauses, quit handling."""
+    results = []
+    for i, num in enumerate(cases, 1):
+        ui.log(f"[{i}/{len(cases)}] SOC{num}")
+        _notify(ui, num, "WORKING")
+        try:
+            status, detail = run_one(num)
+        except KeyboardInterrupt:
+            status, detail = "QUIT", "interrupted"
+        except Exception as e:
+            if on_error:
+                on_error(num)
+            log_exception(f"case {num} failed", e)
+            status, detail = "ERROR", str(e)[:200]
+        _notify(ui, num, status, detail)
+        results.append({"case": f"SOC{num}", "status": status, "detail": detail})
+        if status == "NOT_FOUND":
+            ui.log(f"    !!! NOT FOUND - flagged: SOC{num}")
+            if not opts.no_pause:
+                if ui.ask("    [Enter]=continue | q=quit > ", ("", "q"),
+                          kind="notfound") == "q":
+                    break
+        elif status == "ERROR":
+            ui.log(f"    !!! ERROR: {detail}")
+        elif status == "QUIT":
+            ui.log("    Stopping at user request.")
+            break
+        if status == "SENT" and i < len(cases):
+            delay = getattr(opts, "send_delay", 5.0)
+            if delay > 0:
+                ui.log(f"    Waiting {delay:g}s before the next case...")
+                time.sleep(delay)
+    return results
+
+
+def _run_web(cases, opts, ui):
+    shots_dir = SCRIPT_DIR / "screenshots"
+    log.info("run starting: %d case(s), url=%s, engine=%s, monitor=%s, "
+             "settle=%ss, send_delay=%ss, pause_on_notfound=%s",
+             len(cases), opts.url, getattr(opts, "engine", "standard"),
+             getattr(opts, "monitor", "largest"), opts.settle,
+             getattr(opts, "send_delay", 0), not opts.no_pause)
+    log.debug("cases: %s", cases)
+    driver = _launch_browser(opts, ui)
+    log_browser(driver)
+    try:
+        driver.get(opts.url)
+        ui.log("If a login page appears, sign in manually (MFA included).")
+        ui.log("Waiting up to 5 minutes for the mailbox to load...")
+        if wait_for_mailbox(driver, 300) is None:
+            raise RuntimeError("mailbox never loaded - run again and sign in")
+        ui.log("Mailbox ready.\n")
+
+        results = _case_loop(
+            cases, opts, ui,
+            run_one=lambda num: process_case(driver, num, opts, shots_dir, ui),
+            on_error=lambda num: screenshot(driver, shots_dir, f"case_{num}_error"),
+        )
+    finally:
+        try:
+            driver.quit()
+        except Exception:
+            pass
+        time.sleep(2)  # let Chrome write out cookies before sweeping orphans
+        _release_stale_profile(opts.profile_dir)
+    return results
+
+
+def sign_in_only(opts, ui):
+    """Open the mailbox just so the analyst can sign in once; the session is
+    saved to the profile, then the browser closes cleanly."""
+    driver = _launch_browser(opts, ui)
+    try:
+        driver.get(opts.url)
+        ui.log("Sign in to Outlook in the browser window "
+               "(choose 'Yes' at 'Stay signed in?').")
+        if wait_for_mailbox(driver, 300) is None:
+            ui.log("Didn't reach the mailbox - not signed in yet.")
+            return False
+        ui.log("Signed in. Saving the session...")
+        time.sleep(3)  # give Chrome a moment to persist the login cookies
+        return True
+    finally:
+        try:
+            driver.quit()
+        except Exception:
+            pass
+        time.sleep(2)
+        _release_stale_profile(opts.profile_dir)
+
+
+def run_followups(src_path, column, cases, opts, ui):
+    """Run every case, then write the result files. Returns a summary."""
+    setup_logging()          # no-op if the caller already started logging
+    log.info("input sheet   : %s (column %r)", src_path, column)
+    results = _run_web(cases, opts, ui)
+
+
+    stamp = f"{datetime.now():%Y%m%d_%H%M%S}"
+    out_csv = SCRIPT_DIR / f"followup_results_{stamp}.csv"
+    with open(out_csv, "w", encoding="utf-8-sig", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=["case", "status", "detail"])
+        w.writeheader()
+        w.writerows(results)
+
+    # anything not replied to needs a human: not-found AND errored cases
+    flagged = [r["case"] for r in results
+               if r["status"] in ("NOT_FOUND", "ERROR")]
+    not_found = [r["case"] for r in results if r["status"] == "NOT_FOUND"]
+    errored = [r["case"] for r in results if r["status"] == "ERROR"]
+    done = sum(1 for r in results if r["status"] == "SENT")
+    ui.log(f"\nDone. {done} replied, {len(not_found)} not found, "
+           f"{len(errored)} errored, {len(results)} processed. "
+           f"Log: {out_csv.name}")
+    if flagged:
+        ui.log("NEEDS MANUAL FOLLOW-UP:")
+        for r in results:
+            if r["status"] in ("NOT_FOUND", "ERROR"):
+                ui.log(f"  {r['case']} ({r['status']})")
+
+    # Colour-coded copy of the analyst's own sheet: green = replied,
+    # red = still needs a human, yellow = never got to it.
+    xlsx = SCRIPT_DIR / f"followup_review_{stamp}.xlsx"
+    status_by_case = {r["case"].replace("SOC", ""): r["status"] for r in results}
+    try:
+        if write_status_xlsx(src_path, column, status_by_case, xlsx):
+            ui.log(f"Review sheet (green = replied, red = needs follow-up): "
+                   f"{xlsx.name}")
+        else:
+            xlsx = None
+    except Exception as e:
+        # never lose the run's results just because the copy failed
+        ui.log(f"(couldn't write the review sheet: {e})")
+        xlsx = None
+    log.info("run finished: %d replied, %d not found, %d errored, %d processed",
+             done, len(not_found), len(errored), len(results))
+    if LOG_PATH:
+        ui.log(f"Log (send this if something went wrong): {LOG_PATH.name}")
+    return {"results": results, "out_csv": out_csv, "flagged": flagged,
+            "not_found": not_found, "errors": errored, "xlsx": xlsx,
+            "log": LOG_PATH}
+
+
+def collect_diagnostics(out_path=None):
+    """Zip the logs, screenshots and result files so they can be sent on.
+
+    Contains case numbers and email subjects, so treat it like the XSOAR
+    export itself. The signed-in browser profile is never included.
+    """
+    import zipfile
+    out_path = Path(out_path or
+                    SCRIPT_DIR / f"diagnostics_{datetime.now():%Y%m%d_%H%M%S}.zip")
+    added = []
+    with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED) as z:
+        for folder in ("logs", "screenshots"):
+            base = SCRIPT_DIR / folder
+            if base.is_dir():
+                for f in sorted(base.iterdir())[-40:]:
+                    if f.is_file():
+                        z.write(f, arcname=f"{folder}/{f.name}")
+                        added.append(f"{folder}/{f.name}")
+        for f in sorted(SCRIPT_DIR.glob("followup_results_*.csv"))[-5:]:
+            z.write(f, arcname=f.name)
+            added.append(f.name)
+        env = "\n".join(environment_report())
+        z.writestr("environment.txt", env)
+        added.append("environment.txt")
+    return out_path, added
+
+# ------------------------------------------------------------------------ CLI
+
+def main():
+    ap = argparse.ArgumentParser(description="SOC nightshift follow-up helper")
+    ap.add_argument("--csv", required=True, help="XSOAR export (.csv or .xlsx)")
+    ap.add_argument("--column", help="column holding case numbers (auto-detected if omitted)")
+    ap.add_argument("--url", default="https://outlook.office.com/mail/",
+                    help="Outlook web URL (use https://outlook.live.com/mail/ for a personal test mailbox)")
+    ap.add_argument("--profile-dir", default=str(SCRIPT_DIR / "uc_profile"),
+                    help="Browser profile folder (keeps you logged in between runs)")
+    ap.add_argument("--settle", type=float, default=3.0,
+                    help="Seconds to wait after searching before reading results")
+    ap.add_argument("--send-delay", type=float, default=5.0,
+                    help="Seconds to pause after a sent reply before the next case")
+    ap.add_argument("--engine", default="standard", choices=["standard", "stealth"],
+                    help="'standard' = plain Selenium Chrome automation (default). "
+                         "'stealth' = SeleniumBase undetected mode, only for "
+                         "personal outlook.com accounts that keep signing out")
+    ap.add_argument("--monitor", default="largest",
+                    help="Which screen to run the browser on: largest (default), "
+                         "primary, current, or a monitor number")
+    ap.add_argument("--list-monitors", action="store_true",
+                    help="Show the detected monitors and exit")
+    ap.add_argument("--limit", type=int, help="Only process the first N cases (for testing)")
+    ap.add_argument("--no-pause", action="store_true",
+                    help="Don't pause on not-found cases, just flag and continue")
+    ap.add_argument("--parse-only", action="store_true",
+                    help="Just show the case numbers read from the file, then exit")
+    ap.add_argument("--verbose", action="store_true",
+                    help="Also print the detailed log to the console")
+    ap.add_argument("--diagnostics", action="store_true",
+                    help="Zip up logs, screenshots and result files to send on, "
+                         "then exit")
+    ap.add_argument("--check", action="store_true",
+                    help="Dry-run a new export: what would be processed and what "
+                         "would be ignored. Touches nothing.")
+    args = ap.parse_args()
+    setup_logging(verbose=args.verbose)
+
+    if args.diagnostics:
+        path, added = collect_diagnostics()
+        print(f"Diagnostics bundle: {path}")
+        for name in added:
+            print(f"   {name}")
+        print("\nSend this on if something went wrong. It holds case numbers "
+              "and email\nsubjects, so treat it like the XSOAR export. Your "
+              "signed-in browser\nsession is NOT included.")
+        return
+
+    if args.list_monitors:
+        mons = describe_monitors()
+        print("\n".join(mons) if mons else "No monitors detected.")
+        return
+
+    if args.check:
+        try:
+            print(format_preflight(preflight(args.csv, args.column)))
+        except ValueError as e:
+            sys.exit(f"ERROR: {e}")
+        return
+
+    stats = {}
+    try:
+        column, cases = extract_cases(args.csv, args.column, stats)
+    except ValueError as e:
+        sys.exit(f"ERROR: {e}")
+    print(f"File: {args.csv}")
+    hidden = stats.get("hidden_skipped", 0)
+    hidden_note = f" ({hidden} filtered-out row(s) skipped)" if hidden else ""
+    print(f"Case-number column: '{column}' -> {len(cases)} unique case(s){hidden_note}")
+    if args.limit:
+        cases = cases[: args.limit]
+        print(f"Limited to first {len(cases)} case(s)")
+    if args.parse_only:
+        for n in cases:
+            print(f"  SOC{n}")
+        return
+    if not cases:
+        sys.exit("Nothing to do - no case numbers found.")
+
+    try:
+        run_followups(args.csv, column, cases, args, ConsoleUI())
+    except RuntimeError as e:
+        sys.exit(f"ERROR: {e}")
+
+
+if __name__ == "__main__":
+    main()

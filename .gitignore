@@ -1,0 +1,21 @@
+# signed-in browser sessions - never commit these
+uc_profile/
+owa_profile/
+
+# run output
+logs/
+screenshots/
+followup_results_*.csv
+followup_review_*.xlsx
+followup_flagged_*.xlsx
+diagnostics_*.zip
+
+# selenium/seleniumbase working files
+downloaded_files/
+chromedriver.exe
+
+# build artefacts
+__pycache__/
+*.pyc
+SOC_Followup_*.zip
+SOC_Followup_single.py*
