@@ -1,0 +1,94 @@
+REQUEST DETAILS - SOC nightshift follow-up helper
+=================================================
+Everything an IT / security reviewer usually asks for, in one place.
+
+
+WHAT IT IS
+  A local Python script an analyst runs on their own laptop. It reads the
+  filtered case export, searches each case in Outlook on the web, and opens
+  a Reply All draft. The analyst reviews and sends every email themselves.
+  It reduces manual copy-pasting for ~300 cases per night shift.
+
+
+WHAT IS BEING ASKED FOR
+  1. Internal PyPI index URL, so pip can install the packages below
+     (or have them provisioned on the machine)
+  2. A sanctioned way to get the script file onto the SOC laptop
+     (email, cloud storage and public code hosting are all blocked)
+
+
+PACKAGES REQUIRED
+  Python 3.10 or newer (already available on the machine).
+
+  Installed directly - these are the only three that get named:
+
+    Package    Version   Licence       Purpose
+    --------   -------   -----------   -------------------------------------
+    selenium   >= 4.15   Apache-2.0    drives the Chrome window
+    openpyxl   >= 3.1    MIT           reads the .xlsx case export
+    psutil     >= 5.9    BSD-3-Clause  optional; tidies leftover browser
+                                       processes between runs
+
+  Pulled in automatically as dependencies of those three (listed in full so
+  nothing is a surprise to a mirror allow-list):
+
+    Package             Version       Licence          Required by
+    -----------------   -----------   --------------   --------------------
+    certifi             2026.7.22     MPL-2.0          selenium
+    urllib3             2.7.0         MIT              selenium
+    websocket-client    1.9.0         Apache-2.0       selenium
+    trio                0.33.0        MIT/Apache-2.0   selenium
+    trio-websocket      0.12.2        MIT              selenium
+    typing_extensions   4.16.0        PSF-2.0          selenium
+    attrs               26.1.0        MIT              trio
+    cffi                2.0.0         MIT              trio
+    exceptiongroup      1.3.1         MIT              trio
+    idna                3.18          BSD-3-Clause     trio
+    outcome             1.3.0         MIT/Apache-2.0   trio
+    sniffio             1.3.1         MIT/Apache-2.0   trio
+    sortedcontainers    2.4.0         Apache-2.0       trio
+    wsproto             1.3.2         MIT              trio-websocket
+    h11                 0.16.0        MIT              wsproto
+    pycparser           3.0           BSD-3-Clause     cffi
+    PySocks             1.7.1         BSD              urllib3
+    et_xmlfile          2.0.0         MIT              openpyxl
+
+  21 packages in total. All are long-established, widely used, permissively
+  licensed (MIT / BSD / Apache / MPL) and are normally already mirrored
+  internally. Nothing custom, nothing unusual.
+
+  One command installs the lot:
+      pip install selenium openpyxl psutil
+
+
+WHAT IT DOES NOT DO
+  * does not send email by itself - the analyst sends every one
+  * no mailbox API, app registration, service account or extra permissions;
+    it uses the analyst's own Outlook session in the browser
+  * no server, database, cloud service, scheduled task or listening port
+  * no admin rights; nothing installed into Outlook
+  * no credentials stored by the tool - sign-in happens on Microsoft's own
+    page, and the session is kept in a local browser profile folder
+
+
+NETWORK ACCESS
+  Outlook on the web only (outlook.cloud.microsoft / outlook.office.com),
+  i.e. the same traffic as using Outlook by hand.
+  One-off on first run: Selenium fetches a matching chromedriver. If that
+  is blocked, a chromedriver.exe can be placed beside the script instead.
+
+
+DATA HANDLING
+  Reads   : the case export the analyst selects
+  Writes  : results log (CSV), a colour-coded copy of the sheet (XLSX),
+            per-run logs, and failure screenshots - all in its own folder
+  These contain case numbers and email subjects, so they carry the same
+  classification as the export itself. Nothing is transmitted anywhere.
+
+
+ASSURANCE
+  Ships with two test suites that run offline, with no mailbox access:
+      python audit_simulation.py    13 checks, simulated Outlook end-to-end
+      python test_edge_cases.py     14 edge cases
+  Both print PASS/FAIL per check. Source is a few plain .py files and can
+  be read in full - roughly 1,500 lines, no compiled components.
