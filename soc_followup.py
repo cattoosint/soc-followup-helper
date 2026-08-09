@@ -416,13 +416,54 @@ def get_search_box(driver):
     ])
 
 
-def wait_for_mailbox(page, timeout_s):
+LOGIN_URL_HINTS = ("login.microsoftonline.com", "login.live.com",
+                   "login.microsoft", "/oauth", "signin")
+
+
+def on_login_page(page):
+    """Are we sitting on a Microsoft sign-in page rather than the mailbox?"""
+    try:
+        url = (page.current_url or "").lower()
+        if any(hint in url for hint in LOGIN_URL_HINTS):
+            return True
+        return _find_first(page, ["input[type='password']",
+                                  "input[name='loginfmt']", "#i0116"]) is not None
+    except Exception:
+        return False
+
+
+def wait_for_mailbox(page, timeout_s, ui=None):
+    """Wait until the inbox is actually open.
+
+    Signing in can take a while - MFA, a password prompt, picking an
+    account - so this keeps waiting and says what it is waiting for rather
+    than failing while the analyst is still typing.
+    """
     deadline = time.time() + timeout_s
+    announced = False
+    next_nudge = time.time() + 30
     while time.time() < deadline:
         box = get_search_box(page)
         if box is not None:
+            if announced:
+                log.info("signed in - inbox reached")
+                if ui:
+                    ui.log("    Signed in - inbox loaded, carrying on.")
             return box
+        if not announced and on_login_page(page):
+            announced = True
+            log.info("sign-in page detected - waiting for the analyst")
+            if ui:
+                ui.log("    Sign-in page - log in in the browser window "
+                       "(tick 'Stay signed in?'). Waiting for the inbox...")
+        if time.time() >= next_nudge:
+            next_nudge = time.time() + 30
+            left = int(deadline - time.time())
+            log.debug("still waiting for the inbox (%ss left)", left)
+            if ui and announced:
+                ui.log(f"    Still waiting for sign-in... ({left // 60} min left)")
         time.sleep(2)
+    log.warning("gave up waiting for the inbox after %ss", timeout_s)
     return None
 
 
@@ -895,8 +936,8 @@ def _ensure_mailbox(page, opts, ui):
     except Exception:
         pass
     ui.log("    Signed out? Sign in again in the automated browser window "
-           "(choose 'Yes' at 'Stay signed in?'). Waiting up to 5 minutes...")
-    ok = wait_for_mailbox(page, 300) is not None
+           "(choose 'Yes' at 'Stay signed in?'). It waits for the inbox.")
+    ok = wait_for_mailbox(page, 1800, ui) is not None
     log.info("  signed back in: %s", ok)
     return ok
 
@@ -1456,10 +1497,10 @@ def _run_web(cases, opts, ui):
     log_browser(driver)
     try:
         driver.get(opts.url)
-        ui.log("If a login page appears, sign in manually (MFA included).")
-        ui.log("Waiting up to 5 minutes for the mailbox to load...")
-        if wait_for_mailbox(driver, 300) is None:
-            raise RuntimeError("mailbox never loaded - run again and sign in")
+        ui.log("If a login page appears, sign in manually (MFA included) - "
+               "it waits until the inbox is open.")
+        if wait_for_mailbox(driver, 1800, ui) is None:
+            raise RuntimeError("the inbox never opened - sign in, then run again")
         ui.log("Mailbox ready.\n")
 
         results = _case_loop(
@@ -1485,8 +1526,9 @@ def sign_in_only(opts, ui):
         driver.get(opts.url)
         ui.log("Sign in to Outlook in the browser window "
                "(choose 'Yes' at 'Stay signed in?').")
-        if wait_for_mailbox(driver, 300) is None:
-            ui.log("Didn't reach the mailbox - not signed in yet.")
+        ui.log("Waiting until the inbox opens - take as long as you need.")
+        if wait_for_mailbox(driver, 1800, ui) is None:
+            ui.log("Gave up waiting - the inbox never opened.")
             return False
         ui.log("Signed in. Saving the session...")
         time.sleep(3)  # give Chrome a moment to persist the login cookies
