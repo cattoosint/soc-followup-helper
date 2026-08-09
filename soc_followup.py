@@ -490,9 +490,16 @@ def build_queries(num):
 
 
 _TIME_RE = re.compile(r"(\d{1,2}):(\d{2})\s*([AP])\.?M\.?", re.I)
+_TIME24_RE = re.compile(r"\b([01]?\d|2[0-3]):([0-5]\d)\b")
 _FULLDATE_RE = re.compile(r"\b(\d{1,2})/(\d{1,2})/(\d{2,4})\b")
 _SHORTDATE_RE = re.compile(r"\b(\d{1,2})/(\d{1,2})\b")
-_WEEKDAY_RE = re.compile(r"\b(Mon|Tue|Wed|Thu|Fri|Sat|Sun)\w*\b", re.I)
+# only real weekday words - "\w*" used to swallow "Monitoring", "Satellite",
+# "Wedge" and friends, back-dating a mail by up to six days
+_WEEKDAY_RE = re.compile(
+    r"\b(Mon|Monday|Tue|Tues|Tuesday|Wed|Wednesday|Thu|Thur|Thurs|Thursday|"
+    r"Fri|Friday|Sat|Saturday|Sun|Sunday)\b", re.I)
+_TODAY_RE = re.compile(r"\btoday\b", re.I)
+_YESTERDAY_RE = re.compile(r"\byesterday\b", re.I)
 _WEEKDAYS = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
 
 
@@ -513,6 +520,18 @@ def parse_row_time(label, now=None):
         if t.group(3).upper() == "P":
             hour += 12
         minute = int(t.group(2))
+    else:
+        t24 = _TIME24_RE.search(label)      # mailboxes set to a 24-hour clock
+        if t24:
+            hour, minute = int(t24.group(1)), int(t24.group(2))
+
+    if _YESTERDAY_RE.search(label):
+        day = now - timedelta(days=1)
+        return day.replace(hour=hour or 0, minute=minute or 0,
+                           second=0, microsecond=0)
+    if _TODAY_RE.search(label):
+        return now.replace(hour=hour or 0, minute=minute or 0,
+                           second=0, microsecond=0)
 
     m = _FULLDATE_RE.search(label)
     if m:
@@ -544,8 +563,15 @@ def parse_row_time(label, now=None):
     day = now
     if wd:
         target = _WEEKDAYS[wd.group(1)[:3].lower()]
-        day = now - timedelta(days=(now.weekday() - target) % 7)
-    return day.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        delta = (now.weekday() - target) % 7
+        # Outlook labels a mail by weekday only when it is not today, so a
+        # matching weekday name means a week ago, not this morning
+        day = now - timedelta(days=delta or 7)
+    stamp = day.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if stamp > now + timedelta(minutes=5):
+        # a time later today means it arrived yesterday, not in the future
+        stamp -= timedelta(days=1)
+    return stamp
 
 
 def sort_newest_first(items, now=None):
@@ -786,17 +812,38 @@ def normalize_text(value):
     return "".join(out).lower()
 
 
-def sender_part(header):
-    """Just the sender from a message header line.
+QUOTED_HEADER_RE = re.compile(r"\b(from|sent|subject|to|cc|bcc)\s*:", re.I)
 
-    OWA renders it as "<sender> To:<recipients> <date> ...", so without
-    trimming, a name in the To: line would be read as the person who sent
-    the message - and auto-send would fire on the wrong thread.
+
+def sender_part(header):
+    """Just the sender of a message, from its header text.
+
+    OWA renders a header as "<sender> To:<recipients> <date> ..." and the
+    element text can also carry body content, including quoted headers from
+    an earlier mail ("From: SOC Alerts <alerts@...> Sent: ..."). Matching
+    against any of that would let a forwarded or quoted message pass as if
+    the expected sender had written it, so anything at or after the first
+    recipient/quoted-header marker is dropped, and so is anything after the
+    first timestamp - the sender always precedes both.
+
+    Returns "" when no plausible sender line can be isolated; callers must
+    treat that as "do not auto-send".
     """
-    cut = re.search(r"\b(To|Cc|Bcc)\s*:", header or "")
+    text = " ".join((header or "").split())
+    if not text:
+        return ""
+
+    cut = QUOTED_HEADER_RE.search(text)
     if cut:
-        header = header[:cut.start()]
-    return (header or "").strip()[:300]
+        if cut.start() == 0:        # starts with "From:" - a quoted header,
+            return ""               # not a real OWA sender line
+        text = text[:cut.start()]
+
+    stamp = MSG_TIME_RE.search(text)
+    if stamp:
+        text = text[:stamp.start()]
+
+    return text.strip()[:120]
 
 
 def reading_pane(page):
@@ -827,7 +874,7 @@ def read_last_message(page):
     except Exception:
         return "", ""
 
-    best_y, header = None, ""
+    candidates = []
     for css in ("div[aria-label*='message' i]", "div[role='listitem']"):
         try:
             elements = root.find_elements(By.CSS_SELECTOR, css)
@@ -845,8 +892,29 @@ def read_last_message(page):
                 y = el.location.get("y", 0)
             except Exception:
                 continue
-            if best_y is None or y > best_y:
-                best_y, header = y, text
+            candidates.append((y, text, parse_row_time(text)))
+
+    if not candidates:
+        return "", body
+
+    # Prefer the newest by its own timestamp. Screen position is not
+    # reliable: "Show newest messages on top" is a per-mailbox setting, and
+    # under it the bottom-most message is the OLDEST one.
+    timed = [c for c in candidates if c[2] is not None]
+    if timed:
+        newest = max(timed, key=lambda c: c[2])
+        ties = [c for c in timed if c[2] == newest[2]]
+        if len(ties) > 1:                    # same minute - fall back to order
+            newest = max(ties, key=lambda c: c[0])
+        header = newest[1]
+    elif len(candidates) == 1:
+        header = candidates[0][1]
+    else:
+        # several messages, none with a readable time: cannot tell which is
+        # newest, so say so rather than guess
+        log.warning("could not order %d messages in the thread by time",
+                    len(candidates))
+        return "", body
 
     return sender_part(header), body
 
@@ -868,6 +936,9 @@ def should_auto_send(last_header, body, keyword, expected_sender):
     # compare with spacing removed: Outlook wraps long addresses mid-word
     # and sprinkles icon characters through the same text
     keyword_ok = normalize_text(keyword) in normalize_text(body)
+    if len(normalize_text(expected_sender)) < 4:
+        return False, ("the configured sender is too short to match safely "
+                       "- use the full address or display name")
     # judged on the latest message's sender line only - never the whole
     # quoted thread, where the expected sender may appear from earlier mails
     sender_ok = normalize_text(expected_sender) in normalize_text(last_header)
@@ -891,22 +962,37 @@ def click_send(page):
     return _click_el(el)
 
 
-def wait_for_reading_pane(page, timeout=12):
-    """True once the clicked mail is actually open (its Reply/Forward/'...'
-    controls are showing) - guards against clicking a non-mail element."""
+def wait_for_reading_pane(page, timeout=12, num=None):
+    """True once the clicked mail is open.
+
+    When `num` is given, the pane must also be showing THAT case - the
+    previous case's mail is still on screen for a moment after clicking,
+    and acting on it would reply to, or auto-send about, the wrong thread.
+    """
     deadline = time.time() + timeout
+    controls_seen = False
     while time.time() < deadline:
-        if _find_first(page, [
+        has_controls = _find_first(page, [
             "button[aria-label='Reply all']",
             "button[aria-label='Reply']",
             "[aria-label='Forward']",
             "button[aria-label='More options']",
             "button[aria-label='More actions']",
-        ]) is not None:
-            return True
-        if _find_by_text(page, "Forward") is not None:
-            return True
+        ]) is not None or _find_by_text(page, "Forward") is not None
+        if has_controls:
+            controls_seen = True
+            if num is None:
+                return True
+            pane = reading_pane(page)
+            try:
+                text = pane.text if pane is not None else ""
+            except Exception:
+                text = ""
+            if text and label_matches_case(text, num):
+                return True
         time.sleep(0.5)
+    if controls_seen and num is not None:
+        log.warning("reading pane never showed case %s - not acting on it", num)
     return False
 
 
@@ -970,14 +1056,24 @@ def verify_sent_web(page, num, ui):
     if not _click_folder(page, "Sent Items"):
         return None
     try:
-        for _attempt in range(3):
+        # A just-sent reply sits in Outbox briefly and the folder list lags
+        # behind it. Being impatient here reports a perfectly good send as
+        # unverified, which sends the analyst chasing nothing - so give it
+        # a proper window and re-open the folder half way through.
+        for attempt in range(8):
             # must use the scoped lookup: the raw listbox selector also
             # matches leftover search suggestions, which would "verify" a
             # reply that was never sent
-            for it in _visible_results(page)[:6]:
+            for it in _visible_results(page)[:12]:
                 if label_matches_case(label_of(it), num):
+                    log.debug("sent-items hit for %s on attempt %d",
+                              num, attempt + 1)
                     return True
-            time.sleep(1.5)  # a just-sent mail can take a moment to appear
+            if attempt == 3:
+                _click_folder(page, "Inbox")     # force the list to refresh
+                time.sleep(0.6)
+                _click_folder(page, "Sent Items")
+            time.sleep(1.5)
         return False
     except Exception:
         return None
@@ -1100,11 +1196,12 @@ def process_case(page, num, opts, shots_dir, ui):
         log.info("opening: %s", label)
         first.click()
         time.sleep(1.0)
-        if not wait_for_reading_pane(page):
+        # must be showing THIS case before anything is read or clicked
+        if not wait_for_reading_pane(page, num=num):
             shot = screenshot(page, shots_dir, f"case_{num}_not_opened")
-            log.error("clicked a result but no reading pane appeared; "
-                      "screenshot: %s", shot)
-            return "ERROR", "clicked the result but no mail opened"
+            log.error("reading pane did not show case %s; screenshot: %s",
+                      num, shot)
+            return "ERROR", f"mail for {num} did not open (screenshot saved)"
     except Exception as e:
         shot = screenshot(page, shots_dir, f"case_{num}_open_fail")
         log_exception(f"case {num}: opening the result (screenshot {shot})", e)
@@ -1139,12 +1236,16 @@ def process_case(page, num, opts, shots_dir, ui):
                       "screenshot: %s - leaving the draft for review", shot)
             ui.log("    Couldn't press Send - review this one by hand.")
         else:
-            time.sleep(2.0)
+            time.sleep(2.5)
             verified = verify_sent_web(page, num, ui)
             log.info("auto-sent %s; sent-items check: %s", num, verified)
             if verified is False:
                 ui.log("    !!! Sent, but not found in Sent Items - check it.")
-                return "ERROR", label + " (auto-send unconfirmed)"
+                return "ERROR", label + " (auto-sent, NOT found in Sent Items)"
+            if verified is None:
+                # say so rather than claiming a check that never ran
+                ui.log("    Sent automatically (could not check Sent Items).")
+                return "SENT", label + " (auto-sent, not verified)"
             ui.log("    Sent automatically and verified.")
             return "SENT", label + " (auto-sent)"
 

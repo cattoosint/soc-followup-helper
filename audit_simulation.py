@@ -148,6 +148,13 @@ class FakeOutlook:
         # --- CSS ---
         if sel == "#topSearchInput":
             return [SearchBox(self)]
+        # the reading pane: the tool checks this really is showing the case
+        # it just clicked before acting on it
+        if ("Reading pane" in sel or "ReadingPaneContainerId" in sel
+                or sel == "div[role='document']"):
+            if not self.open_mail:
+                return []
+            return [El(f"{self.open_mail.row_label} {self.open_mail.subject}")]
         if "uggest" in sel:                              # autocomplete popup
             return [El(f"{self.query} suggestion")] if self.query else []
         if sel.startswith("div[aria-label='Message list']"):
