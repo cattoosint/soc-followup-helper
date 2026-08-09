@@ -1582,7 +1582,9 @@ def collect_diagnostics(out_path=None):
 
 def main():
     ap = argparse.ArgumentParser(description="SOC nightshift follow-up helper")
-    ap.add_argument("--csv", required=True, help="XSOAR export (.csv or .xlsx)")
+    # not required: --driver-info, --list-monitors and --diagnostics are
+    # useful on their own, without a sheet to point at
+    ap.add_argument("--csv", help="XSOAR export (.csv or .xlsx)")
     ap.add_argument("--column", help="column holding case numbers (auto-detected if omitted)")
     ap.add_argument("--url", default="https://outlook.office.com/mail/",
                     help="Outlook web URL (use https://outlook.live.com/mail/ for a personal test mailbox)")
@@ -1647,6 +1649,11 @@ def main():
         mons = describe_monitors()
         print("\n".join(mons) if mons else "No monitors detected.")
         return
+
+    if not args.csv:
+        sys.exit("ERROR: --csv is needed to run cases. For a quick check try:\n"
+                 "  python soc_followup.py --driver-info\n"
+                 "  python soc_followup.py --csv <your export> --check")
 
     if args.check:
         try:
