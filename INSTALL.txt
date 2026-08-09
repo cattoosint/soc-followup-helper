@@ -41,6 +41,31 @@ HOW A RUN GOES
   Cases with no matching mail are flagged, and the run carries on.
 
 
+AUTO-SEND (optional, off by default)
+  Ticking "Auto-send" makes the tool send a reply WITHOUT review, but only
+  when BOTH of these are true:
+
+     * the LATEST message in the thread came from the sender you type in
+       (email address or display name - either works), and
+     * the thread contains the phrase you type in (default: "follow up")
+
+  Anything else still stops and waits for you, exactly as before.
+
+  You must also tick the confirmation box. Note your Outlook signature is
+  used as-is, so check it is correct before turning this on.
+
+  The sender you type is saved in soc_settings.json beside the tool. That
+  file is local only - it is never included in the shared package.
+
+  Every decision is written to the log, e.g.
+      auto-send check for 612100: SEND (matched 'follow up'; latest mail
+      is from 'alerts@example.com')
+      auto-send check for 612002: manual (latest mail is not from ...)
+
+  Auto-sent replies are still verified in Sent Items, and appear in the
+  results as "(auto-sent)".
+
+
 WHAT IT PRODUCES (all in this folder)
   followup_review_*.xlsx   your sheet, colour-coded:
                              green  = replied

@@ -152,6 +152,48 @@ class App:
                                                         columnspan=5, sticky="w",
                                                         pady=(4, 0))
 
+        # --- auto-send: off unless BOTH conditions below are satisfied ----
+        auto = ttk.LabelFrame(root, text="Auto-send (optional)")
+        auto.pack(fill="x", padx=8, pady=(2, 0))
+        saved = core.load_settings()
+        self.auto_var = tk.BooleanVar(value=bool(saved.get("auto_send")))
+        ttk.Checkbutton(
+            auto, text="Send the reply automatically when both conditions match",
+            variable=self.auto_var, command=self.auto_toggled).grid(
+            row=0, column=0, columnspan=4, sticky="w", padx=6, pady=(2, 0))
+
+        ttk.Label(auto, text="only if the mail is from:").grid(
+            row=1, column=0, sticky="w", padx=(24, 0))
+        self.auto_sender_var = tk.StringVar(value=saved.get("auto_sender", ""))
+        self.auto_sender_entry = ttk.Entry(auto, textvariable=self.auto_sender_var,
+                                           width=38)
+        self.auto_sender_entry.grid(row=1, column=1, sticky="w", padx=4)
+        ttk.Label(auto, text="email address or display name",
+                  foreground="#666666").grid(row=1, column=2, sticky="w")
+
+        ttk.Label(auto, text="and the mail contains:").grid(
+            row=2, column=0, sticky="w", padx=(24, 0), pady=(0, 4))
+        self.auto_keyword_var = tk.StringVar(
+            value=saved.get("auto_keyword", "follow up"))
+        self.auto_keyword_entry = ttk.Entry(auto, textvariable=self.auto_keyword_var,
+                                            width=38)
+        self.auto_keyword_entry.grid(row=2, column=1, sticky="w", padx=4, pady=(0, 4))
+        ttk.Label(auto, text="anything else still waits for you",
+                  foreground="#666666").grid(row=2, column=2, sticky="w", pady=(0, 4))
+
+        self.agree_var = tk.BooleanVar(value=False)   # never remembered
+        self.agree_box = ttk.Checkbutton(
+            auto,
+            text="I understand: replies will be sent WITHOUT review when the "
+                 "latest mail in the thread is from the sender above and "
+                 "contains the phrase above.\n"
+                 "My Outlook signature is set correctly, because it goes out "
+                 "as-is.",
+            variable=self.agree_var)
+        self.agree_box.grid(row=3, column=0, columnspan=4, sticky="w",
+                            padx=(24, 6), pady=(2, 6))
+        self.auto_toggled()
+
         ttk.Label(opts, text="Show browser on:").grid(row=2, column=0, sticky="w",
                                                       pady=(4, 0))
         mons = core.describe_monitors()
@@ -319,6 +361,14 @@ class App:
         # a review sheet can be pulled at any point, including mid-run
         self.flagged_btn.config(state="normal" if cases else "disabled")
 
+    def auto_toggled(self):
+        state = "normal" if self.auto_var.get() else "disabled"
+        self.auto_sender_entry.config(state=state)
+        self.auto_keyword_entry.config(state=state)
+        self.agree_box.config(state=state)
+        if not self.auto_var.get():
+            self.agree_var.set(False)     # re-agree every time it is enabled
+
     def _make_opts(self, url):
         try:
             send_delay = float(self.delay_var.get() or 0)
@@ -336,6 +386,9 @@ class App:
             monitor=monitor,
             engine="stealth" if self.stealth_var.get() else "standard",
             no_pause=not self.pause_var.get(),
+            auto_send=bool(self.auto_var.get()),
+            auto_sender=self.auto_sender_var.get().strip(),
+            auto_keyword=self.auto_keyword_var.get().strip(),
         )
 
     def sign_in(self):
@@ -375,8 +428,35 @@ class App:
         if not url.startswith("http"):
             messagebox.showwarning("Outlook URL", "Pick or paste a valid Outlook URL.")
             return
-        self.fill_table(cases)
         opts = self._make_opts(url)
+        if opts.auto_send:
+            if not opts.auto_sender or not opts.auto_keyword:
+                messagebox.showwarning(
+                    "Auto-send",
+                    "Auto-send needs both a sender and a phrase.\n\n"
+                    "Fill those in, or untick auto-send to review every "
+                    "reply yourself.")
+                return
+            if not self.agree_var.get():
+                messagebox.showwarning(
+                    "Auto-send",
+                    "Tick the confirmation box before using auto-send.\n\n"
+                    "It sends replies without review, using your Outlook "
+                    "signature as it is set today.")
+                return
+            if not messagebox.askokcancel(
+                    "Auto-send is on",
+                    f"Replies will be SENT automatically, with no review, "
+                    f"when the LATEST mail in the thread is from:\n"
+                    f"    {opts.auto_sender}\n\nand the thread contains:\n"
+                    f"    {opts.auto_keyword}\n\nCheck your Outlook signature "
+                    f"is correct - it goes out as-is.\n\nEverything else "
+                    f"still waits for you.\n\nStart the run?"):
+                return
+        core.save_settings({"auto_send": opts.auto_send,
+                            "auto_sender": opts.auto_sender,
+                            "auto_keyword": opts.auto_keyword})
+        self.fill_table(cases)
         self.start_btn.config(state="disabled")
         self.signin_btn.config(state="disabled")
         self.log(f"Starting: {len(cases)} case(s)")

@@ -2,6 +2,9 @@
 uc_profile/
 owa_profile/
 
+# local preferences - holds the auto-send sender for THIS site
+soc_settings.json
+
 # run output
 logs/
 screenshots/
@@ -23,3 +26,4 @@ SOC_Followup_single.py*
 
 # the bundled libraries ARE committed - that is the point of this repo
 !libs/
+

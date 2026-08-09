@@ -233,6 +233,38 @@ specific screen with the **Show browser on** dropdown, or
 `--monitor 2` / `--monitor primary` / `--monitor current` on the command
 line. `python soc_followup.py --csv x.xlsx --list-monitors` lists them.
 
+## Auto-send (optional, off by default)
+
+By default every reply waits for the analyst. Ticking **Auto-send** lets the
+tool send without review — but only when **both** conditions hold:
+
+- the **latest** message in the thread is from the sender you configure
+  (email address *or* display name), and
+- the thread contains your phrase (default `follow up`)
+
+Anything else falls back to the normal manual flow, including threads it
+can't read. A confirmation box must also be ticked — the reply goes out with
+your Outlook signature as it is currently set.
+
+Two details that matter, both learned from live testing:
+
+- the sender is taken from the newest message's **From** line only, so a
+  name appearing in `To:` — or the expected sender appearing further down a
+  quoted thread — never counts
+- matching ignores spacing, because Outlook wraps long addresses mid-word
+  (`soc alerts@example.com`) and mixes icon characters into the same text
+
+The configured sender lives in `soc_settings.json` beside the tool, which is
+never committed or packaged. Every decision is logged with its reason, and
+auto-sent replies are still verified in Sent Items.
+
+CLI equivalent:
+
+```
+python soc_followup.py --csv cases.xlsx --auto-send \
+    --auto-sender alerts@example.com --auto-keyword "follow up"
+```
+
 ## Logs and diagnostics
 
 Every run writes `logs\followup_<timestamp>.log` containing the environment

@@ -54,6 +54,34 @@ NO_RESULTS_RE = re.compile(
     r"(couldn.t find|didn.t find|no results|nothing (?:that )?match)", re.I
 )
 
+# ------------------------------------------------------------------- settings
+
+SETTINGS_PATH = SCRIPT_DIR / "soc_settings.json"
+
+
+def load_settings():
+    """Local preferences (mailbox, auto-send sender, ...).
+
+    Kept in soc_settings.json beside the tool and never committed - the
+    sender address is site-specific and does not belong in a repo.
+    """
+    import json
+    try:
+        return json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def save_settings(values):
+    import json
+    try:
+        SETTINGS_PATH.write_text(json.dumps(values, indent=2), encoding="utf-8")
+        return True
+    except Exception as e:
+        log.debug("could not save settings: %s", e)
+        return False
+
+
 # -------------------------------------------------------------------- logging
 
 log = logging.getLogger("soc_followup")
@@ -688,6 +716,140 @@ def click_reply_all(page):
     return False
 
 
+# A conversation stacks messages oldest at the top, newest at the bottom,
+# so the newest message header is the lowest one on screen. Drafts sit at
+# the very bottom and must not be mistaken for a sent message.
+DRAFT_MARKERS = ("[draft]", "this message hasn't been sent", "saved:")
+MSG_TIME_RE = re.compile(r"\d{1,2}:\d{2}\s*[AP]\.?M\.?|\d{1,2}/\d{1,2}/\d{2,4}",
+                         re.I)
+
+
+def normalize_text(value):
+    """Lowercase, with spacing and icon glyphs removed.
+
+    Outlook breaks long addresses for wrapping, so a header can read
+    "soc alertstest@outlook.com" - matching has to ignore that, and the
+    icon characters the UI mixes into the same text. Written with escapes
+    rather than literal characters: this file has been mangled before by a
+    tool that rewrote it in a non-UTF8 encoding.
+    """
+    out = []
+    for ch in (value or ""):
+        if ch.isspace():
+            continue
+        if "\ue000" <= ch <= "\uf8ff":      # private-use icon glyphs
+            continue
+        if ch in ("\u200b", "\ufeff", "\u00a0"):   # zero-width / nbsp
+            continue
+        out.append(ch)
+    return "".join(out).lower()
+
+
+def sender_part(header):
+    """Just the sender from a message header line.
+
+    OWA renders it as "<sender> To:<recipients> <date> ...", so without
+    trimming, a name in the To: line would be read as the person who sent
+    the message - and auto-send would fire on the wrong thread.
+    """
+    cut = re.search(r"\b(To|Cc|Bcc)\s*:", header or "")
+    if cut:
+        header = header[:cut.start()]
+    return (header or "").strip()[:300]
+
+
+def reading_pane(page):
+    for css in ("[aria-label*='Reading pane' i]", "#ReadingPaneContainerId",
+                "div[role='document']"):
+        try:
+            el = page.find_element(By.CSS_SELECTOR, css)
+            if el.is_displayed():
+                return el
+        except Exception:
+            continue
+    return None
+
+
+def read_last_message(page):
+    """(header, body) for the NEWEST message in the open conversation.
+
+    header is that message's sender line - the one auto-send is judged on,
+    so a thread whose latest reply came from someone else is never treated
+    as if it came from the expected sender. Returns ("", "") when the page
+    cannot be read, which callers must treat as "do not auto-send".
+    """
+    root = reading_pane(page)
+    if root is None:
+        return "", ""
+    try:
+        body = root.text or ""
+    except Exception:
+        return "", ""
+
+    best_y, header = None, ""
+    for css in ("div[aria-label*='message' i]", "div[role='listitem']"):
+        try:
+            elements = root.find_elements(By.CSS_SELECTOR, css)
+        except Exception:
+            continue
+        for el in elements:
+            try:
+                if not el.is_displayed():
+                    continue
+                text = " ".join((el.text or "").split())
+                if not text or not MSG_TIME_RE.search(text):
+                    continue          # not a message header
+                if any(m in text.lower() for m in DRAFT_MARKERS):
+                    continue          # an unsent draft, not a real message
+                y = el.location.get("y", 0)
+            except Exception:
+                continue
+            if best_y is None or y > best_y:
+                best_y, header = y, text
+
+    return sender_part(header), body
+
+
+def should_auto_send(last_header, body, keyword, expected_sender):
+    """Both conditions must hold, or the analyst handles it by hand.
+
+    last_header is the newest message's sender line (see read_last_message).
+    The sender may be given as an address or a display name - whichever the
+    mailbox shows. Returns (send_it, reason_for_the_log).
+    """
+    if not keyword or not expected_sender:
+        return False, "auto-send needs both a phrase and a sender configured"
+    if not body:
+        return False, "could not read the message"
+    if not last_header:
+        return False, "could not identify who sent the latest message"
+
+    # compare with spacing removed: Outlook wraps long addresses mid-word
+    # and sprinkles icon characters through the same text
+    keyword_ok = normalize_text(keyword) in normalize_text(body)
+    # judged on the latest message's sender line only - never the whole
+    # quoted thread, where the expected sender may appear from earlier mails
+    sender_ok = normalize_text(expected_sender) in normalize_text(last_header)
+
+    if keyword_ok and sender_ok:
+        return True, f"matched {keyword!r}; latest mail is from {expected_sender!r}"
+    missing = []
+    if not keyword_ok:
+        missing.append(f"{keyword!r} not in the message")
+    if not sender_ok:
+        missing.append(f"latest mail is not from {expected_sender!r} "
+                       f"(saw {last_header[:70]!r})")
+    return False, "; ".join(missing)
+
+
+def click_send(page):
+    """Press Send on the open draft."""
+    el = _find_first(page, ["button[aria-label='Send']",
+                            "button[aria-label^='Send (']",
+                            "button[title^='Send']"])
+    return _click_el(el)
+
+
 def wait_for_reading_pane(page, timeout=12):
     """True once the clicked mail is actually open (its Reply/Forward/'...'
     controls are showing) - guards against clicking a non-mail element."""
@@ -907,6 +1069,18 @@ def process_case(page, num, opts, shots_dir, ui):
         log_exception(f"case {num}: opening the result (screenshot {shot})", e)
         return "ERROR", f"could not open result: {e}"
 
+    # decide about auto-send BEFORE replying, while the original mail is
+    # what's on screen
+    auto_ok, auto_why = False, "auto-send off"
+    if getattr(opts, "auto_send", False):
+        last_header, body = read_last_message(page)
+        log.debug("latest message header: %s", last_header[:200] or "(none)")
+        auto_ok, auto_why = should_auto_send(
+            last_header, body, getattr(opts, "auto_keyword", "follow up"),
+            getattr(opts, "auto_sender", ""))
+        log.info("auto-send check for %s: %s (%s)", num,
+                 "SEND" if auto_ok else "manual", auto_why)
+
     if not click_reply_all(page):
         shot = screenshot(page, shots_dir, f"case_{num}_replyall_fail")
         log.error("Reply all not found (toolbar or ... menu); screenshot: %s",
@@ -914,6 +1088,24 @@ def process_case(page, num, opts, shots_dir, ui):
         return "ERROR", "Reply all button not found (screenshot saved)"
     log.info("reply-all draft opened; compose detected: %s",
              compose_is_open(page))
+
+    if auto_ok:
+        time.sleep(1.5)                      # let the draft finish building
+        ui.log(f"    Auto-send: {auto_why}")
+        if not click_send(page):
+            shot = screenshot(page, shots_dir, f"case_{num}_send_fail")
+            log.error("auto-send could not find the Send button; "
+                      "screenshot: %s - leaving the draft for review", shot)
+            ui.log("    Couldn't press Send - review this one by hand.")
+        else:
+            time.sleep(2.0)
+            verified = verify_sent_web(page, num, ui)
+            log.info("auto-sent %s; sent-items check: %s", num, verified)
+            if verified is False:
+                ui.log("    !!! Sent, but not found in Sent Items - check it.")
+                return "ERROR", label + " (auto-send unconfirmed)"
+            ui.log("    Sent automatically and verified.")
+            return "SENT", label + " (auto-sent)"
 
     time.sleep(1.0)
     if not compose_is_open(page):
@@ -1400,6 +1592,15 @@ def main():
                     help="Seconds to wait after searching before reading results")
     ap.add_argument("--send-delay", type=float, default=5.0,
                     help="Seconds to pause after a sent reply before the next case")
+    ap.add_argument("--auto-send", action="store_true",
+                    help="Send the reply automatically when the open mail "
+                         "contains --auto-keyword AND came from --auto-sender. "
+                         "Anything else still waits for you.")
+    ap.add_argument("--auto-sender", default="",
+                    help="Sender that permits auto-send - email address or "
+                         "display name, e.g. alerts@example.com or 'SOC Alerts'")
+    ap.add_argument("--auto-keyword", default="follow up",
+                    help="Phrase that must appear in the mail (default: 'follow up')")
     ap.add_argument("--engine", default="standard", choices=["standard", "stealth"],
                     help="'standard' = plain Selenium Chrome automation (default). "
                          "'stealth' = SeleniumBase undetected mode, only for "
