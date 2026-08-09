@@ -1092,6 +1092,73 @@ def _release_stale_profile(profile_dir, ui=None):
     return len(victims)
 
 
+def chrome_version():
+    """Installed Chrome version, e.g. '151.0.7922.76' (None if not found)."""
+    try:
+        import winreg
+        for root in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+            try:
+                with winreg.OpenKey(root, r"Software\Google\Chrome\BLBeacon") as k:
+                    return winreg.QueryValueEx(k, "version")[0]
+            except OSError:
+                continue
+    except Exception:
+        pass
+    for path in (r"C:\Program Files\Google\Chrome\Application",
+                 r"C:\Program Files (x86)\Google\Chrome\Application"):
+        try:
+            versions = [d.name for d in Path(path).iterdir()
+                        if d.is_dir() and d.name[0].isdigit()]
+            if versions:
+                return sorted(versions)[-1]
+        except Exception:
+            continue
+    return None
+
+
+def find_local_driver(version=None):
+    """A chromedriver.exe shipped with the tool, preferring one whose major
+    version matches Chrome. Lets the tool work where driver downloads are
+    blocked."""
+    major = (version or "").split(".")[0]
+    beside = SCRIPT_DIR / "chromedriver.exe"
+    if beside.exists():
+        return beside
+    drivers = SCRIPT_DIR / "drivers"
+    if not drivers.is_dir():
+        return None
+    candidates = sorted(drivers.glob("chromedriver*.exe"))
+    if major:
+        for path in candidates:
+            if major in path.stem:
+                return path
+    return candidates[0] if candidates else None
+
+
+def driver_info():
+    """What Chrome is installed, and whether we have a driver to match."""
+    version = chrome_version()
+    major = (version or "?").split(".")[0]
+    out = [f"Chrome installed : {version or 'not detected'}"]
+    local = find_local_driver(version)
+    if local:
+        matched = major in local.stem or local.name == "chromedriver.exe"
+        out.append(f"Bundled driver   : {local.name}"
+                   + ("" if matched else "  (MAJOR VERSION MISMATCH)"))
+    else:
+        out.append("Bundled driver   : none - Selenium will download one, "
+                   "which needs internet")
+    if version and (not local or major not in local.stem):
+        out += [
+            "",
+            f"To work offline, download the chromedriver for Chrome {major}:",
+            "  https://googlechromelabs.github.io/chrome-for-testing/",
+            f"  pick win64 for version {major}.x, then put chromedriver.exe",
+            f"  in: {SCRIPT_DIR}",
+        ]
+    return out
+
+
 def _launch_browser(opts, ui=None):
     """Start Chrome with a persistent profile.
 
@@ -1125,12 +1192,21 @@ def _launch_browser(opts, ui=None):
         options = Options()
         options.add_argument(f"--user-data-dir={profile_dir}")
         options.add_argument("--start-maximized")
-        # If the environment blocks driver downloads, drop a matching
-        # chromedriver.exe beside this script and it gets used instead.
-        local_driver = SCRIPT_DIR / "chromedriver.exe"
-        service = (Service(executable_path=str(local_driver))
-                   if local_driver.exists() else Service())
-        driver = webdriver.Chrome(options=options, service=service)
+        # Prefer a driver shipped with the tool - environments that block
+        # driver downloads are exactly where this is used.
+        local_driver = find_local_driver(chrome_version())
+        if local_driver:
+            log.info("using bundled driver: %s", local_driver.name)
+            service = Service(executable_path=str(local_driver))
+        else:
+            log.info("no bundled driver - Selenium will fetch one")
+            service = Service()
+        try:
+            driver = webdriver.Chrome(options=options, service=service)
+        except Exception as e:
+            log_exception("Chrome failed to start", e)
+            raise RuntimeError(
+                f"{e}\n\n" + "\n".join(driver_info())) from None
 
     if ui:
         ui.log("Browser: Chrome ("
@@ -1333,6 +1409,9 @@ def main():
                          "primary, current, or a monitor number")
     ap.add_argument("--list-monitors", action="store_true",
                     help="Show the detected monitors and exit")
+    ap.add_argument("--driver-info", action="store_true",
+                    help="Show the Chrome version and which driver will be "
+                         "used, then exit")
     ap.add_argument("--limit", type=int, help="Only process the first N cases (for testing)")
     ap.add_argument("--no-pause", action="store_true",
                     help="Don't pause on not-found cases, just flag and continue")
@@ -1357,6 +1436,10 @@ def main():
         print("\nSend this on if something went wrong. It holds case numbers "
               "and email\nsubjects, so treat it like the XSOAR export. Your "
               "signed-in browser\nsession is NOT included.")
+        return
+
+    if args.driver_info:
+        print("\n".join(driver_info()))
         return
 
     if args.list_monitors:

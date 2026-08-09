@@ -13,6 +13,7 @@ diagnostics_*.zip
 # selenium/seleniumbase working files
 downloaded_files/
 chromedriver.exe
+!drivers/
 
 # build artefacts
 __pycache__/
