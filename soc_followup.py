@@ -25,11 +25,19 @@ GUI:
 import argparse
 import csv
 import logging
+import os
 import platform
 import re
 import sys
 import time
 import traceback
+
+# Use the libraries bundled in libs\ if they are present, so the tool runs
+# straight from the folder with nothing to pip install. A system-installed
+# selenium/openpyxl still wins if the analyst has one.
+_LIBS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "libs")
+if os.path.isdir(_LIBS) and _LIBS not in sys.path:
+    sys.path.append(_LIBS)
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -89,10 +97,12 @@ def environment_report():
     out = [f"tool folder   : {SCRIPT_DIR}",
            f"python        : {sys.version.split()[0]} ({sys.executable})",
            f"platform      : {platform.platform()}"]
+    out.append(f"bundled libs  : {'yes' if os.path.isdir(_LIBS) else 'no'}")
     for mod in ("selenium", "openpyxl", "psutil", "seleniumbase"):
         try:
             m = __import__(mod)
-            out.append(f"{mod:<14}: {getattr(m, '__version__', 'installed')}")
+            where = "bundled" if _LIBS in str(getattr(m, "__file__", "")) else "system"
+            out.append(f"{mod:<14}: {getattr(m, '__version__', 'installed')} ({where})")
         except ImportError:
             out.append(f"{mod:<14}: not installed")
     return out

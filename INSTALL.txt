@@ -1,92 +1,83 @@
-SOC NIGHTSHIFT FOLLOW-UP  -  INSTALL INSTRUCTIONS
-=================================================
+SOC NIGHTSHIFT FOLLOW-UP
+========================
 
-WHAT THIS IS
-  A local Python tool that reads the filtered XSOAR export, searches each
-  case in Outlook on the web, and opens the Reply All draft. It never sends
-  anything - the analyst reviews and sends every email. Nothing is
-  installed into Outlook and no mailbox permissions are needed.
+Nothing to install. The libraries it needs are already in the libs folder,
+so there is no pip, no downloads and no internet needed to set it up.
 
 
-REQUIREMENTS
+WHAT YOU NEED
   * Windows
-  * Python 3.10 or newer  ("Add python.exe to PATH" ticked at install)
+  * Python 3.10 or newer   (check with:  python --version)
   * Google Chrome
 
 
-INSTALL - THE EASY WAY
-  1. Unzip this folder somewhere in your own profile,
-     e.g.  C:\Users\<you>\SOC Followup\
-     (do NOT run it from a shared drive)
-  2. Double-click  install.bat
-  3. When it says "Setup complete", double-click  run_followup.bat
+GETTING STARTED
+  1. Put this folder somewhere in your own profile, e.g.
+         C:\Users\<you>\SOC Followup\
+     (not a shared drive - it keeps a signed-in browser session)
+
+  2. Double-click   START HERE.bat
+     (or run:  python soc_gui.py)
+
+  3. Click "Sign in to Outlook", log in, and choose "Yes" at
+     "Stay signed in?". It is remembered from then on.
+
+  4. Click "Browse..." and pick your filtered case export.
+     Save it as .xlsx so the Excel filter is preserved - rows you filtered
+     out are skipped.
+
+  5. Click "Check export" - confirms it reads the case numbers correctly.
+
+  6. Set Limit to 2 or 3 for a first run, then "Start follow-ups".
 
 
-INSTALL - IF install.bat WAS STRIPPED BY THE EMAIL GATEWAY
-  Some mail gateways remove .bat files. If install.bat is missing, open a
-  Command Prompt in this folder and run these two lines instead:
+HOW A RUN GOES
+  For each case it searches Outlook, opens the Reply All draft, and waits.
+  You review, edit and press Send in Outlook. It notices the send, checks
+  the reply reached Sent Items, pauses 5 seconds, and moves to the next.
 
-      python -m pip install -r requirements.txt
-      python soc_gui.py
+  It never sends an email by itself.
 
-  That is all install.bat does.
-
-
-IF PYTHON IS NOT INSTALLED
-  Get it from Company Portal / Software Center if it is published there,
-  otherwise from https://www.python.org/downloads/ - and tick
-  "Add python.exe to PATH" on the first screen of the installer.
+  Cases with no matching mail are flagged, and the run carries on.
 
 
-IF THE MACHINE NEEDS A PROXY OR AN INTERNAL PACKAGE MIRROR
-  Open install.bat in Notepad and fill in the settings at the top
-  (HTTPS_PROXY / PIP_INDEX_URL / PIP_TRUSTED_HOST), then run it again.
+WHAT IT PRODUCES (all in this folder)
+  followup_review_*.xlsx   your sheet, colour-coded:
+                             green  = replied
+                             red    = no mail found / error - needs a human
+                             amber  = you skipped it
+                             yellow = run stopped before reaching it
+  followup_results_*.csv   every case and its outcome
+  logs\                    detailed log of each run
+  screenshots\             only written when something fails
+  uc_profile\              the signed-in browser session. Treat like a
+                           saved password: one per analyst, do not share.
 
-  Or install the three packages from your internal mirror manually:
-      selenium, openpyxl, psutil
+  The "Review sheet" button rebuilds the colour-coded sheet at any point,
+  including mid-run.
 
 
-FIRST RUN
-  1. Start it with run_followup.bat  (or:  python soc_gui.py)
-  2. Click "Sign in to Outlook" and log in once, choosing "Yes" at
-     "Stay signed in?". The session is remembered after that.
-  3. Click "Browse..." and pick your filtered export (save it as .xlsx so
-     the Excel filter is preserved)
-  4. Click "Check export" to confirm it reads the case numbers correctly
-  5. Set Limit to 2 or 3 for the first run, then click "Start follow-ups"
+CHECKING IT WORKS - no mailbox needed
+  python audit_simulation.py     13 checks against a simulated Outlook
+  python test_edge_cases.py      14 edge cases
 
-  For each case: it searches Outlook, opens the Reply All draft, and waits.
-  You review, edit and press Send in Outlook - it detects the send, checks
-  the reply reached Sent Items, and moves to the next case.
+  Both run offline and print PASS/FAIL per check. Worth running once after
+  copying the folder, to confirm everything arrived intact.
 
 
 IF SOMETHING GOES WRONG
-  Every run writes a detailed log to  logs\followup_<timestamp>.log  -
-  environment, every search it tried, what matched, and full errors.
+  Click "Save diagnostics" - it writes a zip with the logs, any failure
+  screenshots and the run results. That is the file to send for help.
+  It contains case numbers and email subjects, so handle it like the case
+  export itself. The signed-in browser session is never included.
 
-  Click "Save diagnostics" in the tool (or run:
-      python soc_followup.py --csv anything.xlsx --diagnostics
-  ) and it zips the logs, any failure screenshots and the run results into
-  one file you can send on for troubleshooting.
-
-  The zip holds case numbers and email subjects, so handle it like the
-  XSOAR export. Your signed-in browser session is never included.
+  If Chrome fails to start because the driver cannot be downloaded, place a
+  matching chromedriver.exe in this folder and it will be used instead.
+  Check your Chrome version at:  chrome://settings/help
 
 
-WHAT IT LEAVES BEHIND (all inside its own folder)
-  uc_profile\        - the signed-in browser session. Treat this like a
-                       saved password: one per analyst, do not share it,
-                       delete it when handing the machine over.
-  logs\              - one log file per run (see above)
-  followup_results_*.csv   - log of every case and its outcome
-  followup_review_*.xlsx   - your sheet, colour-coded:
-                             green = replied, red = needs manual follow-up,
-                             amber = skipped, yellow = not done yet
-  screenshots\       - only written when something fails, to help debug
-
-
-CHECKING IT WORKS (no mailbox needed)
-      python audit_simulation.py     - full simulated run, 13 checks
-      python test_edge_cases.py      - 14 edge cases
-
-  Both print PASS/FAIL per check and need no network or Outlook access.
+NOTES
+  * Uses your own Outlook session in the browser - no mailbox permissions,
+    no app registration, no admin rights, nothing installed into Outlook.
+  * The "Undetected browser mode" tick-box is only for personal mailboxes
+    that keep signing out. Leave it off at work.

@@ -19,3 +19,6 @@ __pycache__/
 *.pyc
 SOC_Followup_*.zip
 SOC_Followup_single.py*
+
+# the bundled libraries ARE committed - that is the point of this repo
+!libs/
