@@ -1252,7 +1252,9 @@ def place_window(driver, choice="largest", ui=None):
         elif choice == "primary":
             target = next((m for m in mons if m["primary"]), None)
         if target is None:  # 'largest' or a bad choice
-            target = max(mons, key=lambda m: m["w"] * m["h"])
+            # equal-sized screens are common; put it on the primary one,
+            # which is where the analyst is actually looking
+            target = max(mons, key=lambda m: (m["w"] * m["h"], m["primary"]))
     try:
         if target:
             # nudge inside the target monitor first, so maximise picks it
