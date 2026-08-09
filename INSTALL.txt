@@ -71,9 +71,19 @@ IF SOMETHING GOES WRONG
   It contains case numbers and email subjects, so handle it like the case
   export itself. The signed-in browser session is never included.
 
-  If Chrome fails to start because the driver cannot be downloaded, place a
-  matching chromedriver.exe in this folder and it will be used instead.
-  Check your Chrome version at:  chrome://settings/help
+  If Chrome fails to start, check the driver:
+
+      python soc_followup.py --csv x --driver-info
+
+  Drivers for Chrome 150 and 151 ship in the drivers folder and are picked
+  automatically. If your Chrome is a different major version, that command
+  tells you so and gives the download page - grab the win64 driver for your
+  version from:
+
+      https://googlechromelabs.github.io/chrome-for-testing/
+
+  and drop it in this folder as chromedriver.exe. Your Chrome version is at
+  chrome://settings/help
 
 
 NOTES
