@@ -189,7 +189,15 @@ def read_csv_rows(path, stats=None):
         except ImportError:
             raise ValueError("reading .xlsx needs openpyxl - run: pip install openpyxl")
         try:
-            ws = load_workbook(path, data_only=True).active
+            book = load_workbook(path, data_only=True)
+            ws = book.active
+            if len(book.sheetnames) > 1:
+                # .active is whichever tab was showing when it was saved
+                log.info("workbook has %d sheets %s - reading the active one, "
+                         "%r", len(book.sheetnames), book.sheetnames, ws.title)
+                if stats is not None:
+                    stats["sheets"] = book.sheetnames
+                    stats["sheet_used"] = ws.title
         except PermissionError:
             # open in Excel: work from a copy rather than making the analyst
             # close their sheet
@@ -340,6 +348,8 @@ def preflight(path, column=None):
         "blanks": stats.get("blanks", []),
         "duplicate_lines": stats.get("duplicate_lines", set()),
         "header_is_data": header_is_data,
+        "sheets": stats.get("sheets", []),
+        "sheet_used": stats.get("sheet_used", ""),
     }
 
 
@@ -347,6 +357,11 @@ def format_preflight(report):
     out = [f"Case-number column : '{report['column']}'",
            f"Columns in file    : {', '.join(str(c) for c in report['columns'])}",
            f"Rows read          : {report['rows_read']}"]
+    if len(report.get("sheets") or []) > 1:
+        out.append(f"!! The workbook has {len(report['sheets'])} sheets "
+                   f"{report['sheets']}.")
+        out.append(f"   Reading {report['sheet_used']!r} - the one that was "
+                   "showing when it was saved.")
     if report["hidden_skipped"]:
         out.append(f"Filtered out (Excel): {report['hidden_skipped']} row(s) skipped")
     out.append(f"Cases to process   : {len(report['cases'])}")
@@ -549,6 +564,40 @@ _YESTERDAY_RE = re.compile(r"\byesterday\b", re.I)
 _WEEKDAYS = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
 
 
+_DAY_FIRST = None
+
+
+def date_is_day_first():
+    """Does this machine write dates as d/m/yyyy rather than m/d/yyyy?
+
+    Outlook follows the Windows short-date setting, so "10/8/2026" means
+    10 August here and 8 October in the US. Guessing wrong reorders mail by
+    months, which decides which one gets replied to.
+    """
+    global _DAY_FIRST
+    if _DAY_FIRST is None:
+        _DAY_FIRST = False
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                                r"Control Panel\International") as k:
+                fmt = winreg.QueryValueEx(k, "sShortDate")[0]
+            _DAY_FIRST = fmt.strip().lower().startswith("d")
+            log.debug("windows short date %r -> day first: %s", fmt, _DAY_FIRST)
+        except Exception:
+            pass
+    return _DAY_FIRST
+
+
+def _day_month(first, second):
+    """(day, month) from two ambiguous date parts."""
+    if first > 12:
+        return first, second        # only a day can exceed 12
+    if second > 12:
+        return second, first
+    return (first, second) if date_is_day_first() else (second, first)
+
+
 def parse_row_time(label, now=None):
     """Best-effort timestamp from an Outlook row label.
 
@@ -581,7 +630,8 @@ def parse_row_time(label, now=None):
 
     m = _FULLDATE_RE.search(label)
     if m:
-        mo, d, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        d, mo = _day_month(int(m.group(1)), int(m.group(2)))
+        y = int(m.group(3))
         if y < 100:
             y += 2000
         try:
@@ -592,7 +642,7 @@ def parse_row_time(label, now=None):
 
     m = _SHORTDATE_RE.search(label)
     if m:
-        mo, d = int(m.group(1)), int(m.group(2))
+        d, mo = _day_month(int(m.group(1)), int(m.group(2)))
         for year in (now.year, now.year - 1):
             try:
                 base = datetime(year, mo, d, hour or 0, minute or 0)
@@ -733,6 +783,16 @@ def run_search(page, query, settle_s, num=None):
                 return items
             hits = [e for e in items if label_matches_case(label_of(e), num)]
             if hits:
+                # let the list settle: results stream in, and returning on
+                # the first poll can miss a newer mail arriving a moment
+                # later - which is the one that should be replied to
+                time.sleep(0.8)
+                settled = [e for e in _visible_results(page)
+                           if label_matches_case(label_of(e), num)]
+                if len(settled) > len(hits):
+                    log.debug("result list grew from %d to %d while settling",
+                              len(hits), len(settled))
+                    hits = settled
                 log.info("search %r -> %d row(s), %d match case %s",
                          query, len(items), len(hits), num)
                 log.debug("  matched rows: %s",
@@ -833,8 +893,11 @@ def click_reply_all(page):
 # so the newest message header is the lowest one on screen. Drafts sit at
 # the very bottom and must not be mistaken for a sent message.
 DRAFT_MARKERS = ("[draft]", "this message hasn't been sent", "saved:")
-MSG_TIME_RE = re.compile(r"\d{1,2}:\d{2}\s*[AP]\.?M\.?|\d{1,2}/\d{1,2}/\d{2,4}",
-                         re.I)
+                         # 12-hour, 24-hour, or a date - a mailbox set to a
+                         # 24-hour clock used to have no recognisable message
+                         # headers at all, so auto-send could never fire
+MSG_TIME_RE = re.compile(r"\d{1,2}:\d{2}\s*[AP]\.?M\.?|\b\d{1,2}:\d{2}\b|"
+                         r"\d{1,2}/\d{1,2}(?:/\d{2,4})?", re.I)
 
 
 def normalize_text(value):
@@ -1000,8 +1063,35 @@ def should_auto_send(last_header, body, keyword, expected_sender):
     return False, "; ".join(missing)
 
 
-def click_send(page):
-    """Press Send on the open draft."""
+def compose_subject(page):
+    """Subject line of the open draft, if it can be read."""
+    el = _find_first(page, ["input[aria-label='Subject']",
+                            "input[placeholder='Add a subject']",
+                            "input[aria-label*='subject' i]"])
+    if el is None:
+        return ""
+    try:
+        return (el.get_attribute("value") or el.get_attribute("title")
+                or el.text or "")
+    except Exception:
+        return ""
+
+
+def click_send(page, num=None):
+    """Press Send on the open draft.
+
+    With `num`, the draft's subject must carry that case number first. The
+    Send button is found by DOM order, so without this an unrelated draft -
+    one left open from an earlier case - could be the one that goes out.
+    """
+    if num is not None:
+        subject = compose_subject(page)
+        if subject and not label_matches_case(subject, num):
+            log.error("refusing to send: draft subject %r is not case %s",
+                      subject[:80], num)
+            return False
+        if not subject:
+            log.warning("could not read the draft subject for %s", num)
     el = _find_first(page, ["button[aria-label='Send']",
                             "button[aria-label^='Send (']",
                             "button[title^='Send']"])
@@ -1181,7 +1271,7 @@ STATUS_STYLE = {
 
 
 def write_status_xlsx(src_path, column, status_by_case, out_path,
-                      duplicate_lines=None):
+                      duplicate_lines=None, reason_by_case=None):
     """Copy the input sheet, add a status column and colour every row:
     green = replied, red = still needs a human, yellow = not done yet.
 
@@ -1196,13 +1286,14 @@ def write_status_xlsx(src_path, column, status_by_case, out_path,
         log.warning("openpyxl missing - no review sheet written")
         return None
     duplicate_lines = duplicate_lines or set()
+    reason_by_case = reason_by_case or {}
     stats = {}
     headers, rows = read_csv_rows(src_path, stats)
     line_numbers = stats.get("line_numbers") or list(range(2, len(rows) + 2))
     wb = Workbook()
     ws = wb.active
     ws.title = "follow-up"
-    ws.append(list(headers) + ["Follow-up status"])
+    ws.append(list(headers) + ["Follow-up status", "Why"])
     for cell in ws[1]:
         cell.font = Font(bold=True)
 
@@ -1215,15 +1306,22 @@ def write_status_xlsx(src_path, column, status_by_case, out_path,
             status = status_by_case.get(m.group(0), "PENDING") if m else "PENDING"
         text, colour = STATUS_STYLE.get(status, STATUS_STYLE["PENDING"])
         ws.cell(row=ws.max_row, column=len(headers) + 1, value=text)
+        if status == "DUPLICATE":
+            why = "Same case appears earlier in the sheet - handled there"
+        elif status == "PENDING":
+            why = "The run ended before reaching this case"
+        else:
+            why = reason_by_case.get(m.group(0), "") if m else ""
+        ws.cell(row=ws.max_row, column=len(headers) + 2, value=why)
         fill = PatternFill(start_color=colour, end_color=colour, fill_type="solid")
         for cell in ws[ws.max_row]:
             cell.fill = fill
 
-    widths = [max(10, min(44, len(str(h)) + 4)) for h in headers] + [18]
+    widths = [max(10, min(44, len(str(h)) + 4)) for h in headers] + [22, 70]
     for i, w in enumerate(widths, start=1):
         ws.column_dimensions[ws.cell(row=1, column=i).column_letter].width = w
     ws.freeze_panes = "A2"
-    ws.auto_filter.ref = f"A1:{ws.cell(row=1, column=len(headers) + 1).column_letter}" \
+    ws.auto_filter.ref = f"A1:{ws.cell(row=1, column=len(headers) + 2).column_letter}" \
                          f"{ws.max_row}"
     wb.save(out_path)
     return out_path
@@ -1242,7 +1340,8 @@ def process_case(page, num, opts, shots_dir, ui):
             items = run_search(page, q, opts.settle, num=num)
         except RuntimeError:
             if not _ensure_mailbox(page, opts, ui):
-                return "ERROR", "signed out - sign in, then use Retry"
+                return ("ERROR", "signed out - sign in, then use Retry",
+                        "Outlook signed out part way through this case")
             items = run_search(page, q, opts.settle, num=num)
         if items:
             used_query = q
@@ -1257,7 +1356,11 @@ def process_case(page, num, opts, shots_dir, ui):
             log.debug("  page url at failure: %s", page.current_url)
         except Exception:
             pass
-        return "NOT_FOUND", f"no mail matched (tried {len(queries)} searches)"
+        tried = ", ".join(queries[:3])
+        return ("NOT_FOUND",
+                f"no mail matched (tried {len(queries)} searches)",
+                f"Searched {len(queries)} ways ({tried}, ...) - no mail in "
+                f"this mailbox mentions {num}")
 
     try:
         count = len(items)
@@ -1274,11 +1377,14 @@ def process_case(page, num, opts, shots_dir, ui):
             shot = screenshot(page, shots_dir, f"case_{num}_not_opened")
             log.error("reading pane did not show case %s; screenshot: %s",
                       num, shot)
-            return "ERROR", f"mail for {num} did not open (screenshot saved)"
+            return ("ERROR", f"mail for {num} did not open",
+                    "Found the mail but the reading pane never showed "
+                    f"case {num} - nothing was clicked")
     except Exception as e:
         shot = screenshot(page, shots_dir, f"case_{num}_open_fail")
         log_exception(f"case {num}: opening the result (screenshot {shot})", e)
-        return "ERROR", f"could not open result: {e}"
+        return ("ERROR", f"could not open result: {e}",
+                f"Could not open the matching mail: {str(e)[:100]}")
 
     # decide about auto-send BEFORE replying, while the original mail is
     # what's on screen
@@ -1296,18 +1402,20 @@ def process_case(page, num, opts, shots_dir, ui):
         shot = screenshot(page, shots_dir, f"case_{num}_replyall_fail")
         log.error("Reply all not found (toolbar or ... menu); screenshot: %s",
                   shot)
-        return "ERROR", "Reply all button not found (screenshot saved)"
+        return ("ERROR", "Reply all button not found",
+                "Mail opened but Reply all was not there, in the toolbar "
+                "or the ... menu - reply to this one by hand")
     log.info("reply-all draft opened; compose detected: %s",
              compose_is_open(page))
 
     if auto_ok:
         time.sleep(1.5)                      # let the draft finish building
         ui.log(f"    Auto-send: {auto_why}")
-        if not click_send(page):
+        if not click_send(page, num=num):
             shot = screenshot(page, shots_dir, f"case_{num}_send_fail")
-            log.error("auto-send could not find the Send button; "
-                      "screenshot: %s - leaving the draft for review", shot)
-            ui.log("    Couldn't press Send - review this one by hand.")
+            log.error("auto-send did not send; screenshot: %s - leaving the "
+                      "draft for review", shot)
+            ui.log("    Didn't send automatically - review this one by hand.")
         else:
             sent_at = datetime.now()
             time.sleep(2.5)
@@ -1315,13 +1423,18 @@ def process_case(page, num, opts, shots_dir, ui):
             log.info("auto-sent %s; sent-items check: %s", num, verified)
             if verified is False:
                 ui.log("    !!! Sent, but not found in Sent Items - check it.")
-                return "ERROR", label + " (auto-sent, NOT found in Sent Items)"
+                return ("ERROR", label + " (auto-sent, unconfirmed)",
+                        f"Auto-sent ({auto_why}), but no matching reply "
+                        "appeared in Sent Items - check it by hand")
             if verified is None:
                 # say so rather than claiming a check that never ran
                 ui.log("    Sent automatically (could not check Sent Items).")
-                return "SENT", label + " (auto-sent, not verified)"
+                return ("SENT", label + " (auto-sent, not verified)",
+                        f"Auto-sent ({auto_why}); the Sent Items check "
+                        "could not run")
             ui.log("    Sent automatically and verified.")
-            return "SENT", label + " (auto-sent)"
+            return ("SENT", label + " (auto-sent)",
+                    f"Auto-sent ({auto_why}) and confirmed in Sent Items")
 
     time.sleep(1.0)
     if not compose_is_open(page):
@@ -1330,6 +1443,8 @@ def process_case(page, num, opts, shots_dir, ui):
     ui.log(f"    Match ({count} result(s), query {used_query}):")
     if label:
         ui.log(f"    {label}")
+    manual_note = ("" if not getattr(opts, "auto_send", False)
+                   else f" (auto-send did not apply: {auto_why})")
     ui.log("    Reply-all draft is open in the browser. Review, edit, hit Send.")
     _notify(ui, num, "REVIEW", label)
     choice = _ask_with_watch(
@@ -1340,11 +1455,13 @@ def process_case(page, num, opts, shots_dir, ui):
         kind="review",
     )
     if choice == "s":
-        return "SKIPPED", label
+        return ("SKIPPED", label,
+                "Draft was opened; the analyst skipped it without "
+                "sending" + manual_note)
     if choice == "r":
         return process_case(page, num, opts, shots_dir, ui)
     if choice == "q":
-        return "QUIT", ""
+        return "QUIT", "", "Analyst stopped the run at this case"
 
     # draft closed (auto-detected) or analyst said sent - verify in Sent Items
     if choice == "auto":
@@ -1356,9 +1473,13 @@ def process_case(page, num, opts, shots_dir, ui):
              {True: "found", False: "not found", None: "could not check"}[ok])
     if ok is True:
         ui.log("    Verified in Sent Items.")
-        return "SENT", label
+        return ("SENT", label,
+                "Analyst sent it; reply confirmed in Sent Items"
+                + manual_note)
     if ok is None:
-        return "SENT", label + " (send not verified)"
+        return ("SENT", label + " (send not verified)",
+                "Analyst sent it; the Sent Items check could not run"
+                + manual_note)
     ui.log("    !!! Nothing matching in Sent Items.")
     c2 = ui.ask(
         "    Draft closed but I can't find it in Sent Items - was it sent? "
@@ -1367,10 +1488,14 @@ def process_case(page, num, opts, shots_dir, ui):
         kind="verify",
     )
     if c2 == "s":
-        return "SKIPPED", label + " (draft closed without sending)"
+        return ("SKIPPED", label + " (draft closed without sending)",
+                "Draft was closed or discarded without being sent"
+                + manual_note)
     if c2 == "r":
         return process_case(page, num, opts, shots_dir, ui)
-    return "SENT", label
+    return ("SENT", label,
+            "Analyst confirmed they sent it, though it was not found in "
+            "Sent Items" + manual_note)
 
 
 def list_monitors():
@@ -1643,17 +1768,25 @@ def _case_loop(cases, opts, ui, run_one, on_error=None, results=None):
             break
         ui.log(f"[{i}/{len(cases)}] SOC{num}")
         _notify(ui, num, "WORKING")
+        reason = ""
         try:
-            status, detail = run_one(num)
+            outcome = run_one(num)
+            if len(outcome) == 3:
+                status, detail, reason = outcome
+            else:
+                status, detail = outcome
         except KeyboardInterrupt:
             status, detail = "QUIT", "interrupted"
+            reason = "Run interrupted"
         except Exception as e:
             if on_error:
                 on_error(num)
             log_exception(f"case {num} failed", e)
             status, detail = "ERROR", str(e)[:200]
+            reason = f"Something went wrong: {str(e)[:120]}"
         _notify(ui, num, status, detail)
-        results.append({"case": f"SOC{num}", "status": status, "detail": detail})
+        results.append({"case": f"SOC{num}", "status": status,
+                        "detail": detail, "reason": reason})
         if status == "NOT_FOUND":
             ui.log(f"    !!! NOT FOUND - flagged: SOC{num}")
             if not opts.no_pause:
@@ -1754,9 +1887,12 @@ def run_followups(src_path, column, cases, opts, ui):
     stamp = f"{datetime.now():%Y%m%d_%H%M%S}"
     out_csv = SCRIPT_DIR / f"followup_results_{stamp}.csv"
     with open(out_csv, "w", encoding="utf-8-sig", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=["case", "status", "detail"])
+        w = csv.DictWriter(f, fieldnames=["case", "status", "reason", "detail"],
+                           extrasaction="ignore")
         w.writeheader()
-        w.writerows(results)
+        for r in results:
+            w.writerow({"case": r["case"], "status": r["status"],
+                        "reason": r.get("reason", ""), "detail": r["detail"]})
 
     # anything not replied to needs a human: not-found AND errored cases
     flagged = [r["case"] for r in results
@@ -1776,13 +1912,14 @@ def run_followups(src_path, column, cases, opts, ui):
     # Colour-coded copy of the analyst's own sheet: green = replied,
     # red = still needs a human, yellow = never got to it.
     xlsx = SCRIPT_DIR / f"followup_review_{stamp}.xlsx"
-    status_by_case = {}
+    status_by_case, reason_by_case = {}, {}
     for r in results:
         num = r["case"].replace("SOC", "")
         status = r["status"]
         if status == "SENT" and "not verified" in r["detail"]:
             status = "SENT_UNVERIFIED"      # replied, but we could not confirm
         status_by_case[num] = status
+        reason_by_case[num] = r.get("reason", "")
     dup_stats = {}
     try:
         extract_cases(src_path, column, dup_stats)
@@ -1790,7 +1927,7 @@ def run_followups(src_path, column, cases, opts, ui):
         pass
     try:
         if write_status_xlsx(src_path, column, status_by_case, xlsx,
-                             dup_stats.get("duplicate_lines")):
+                             dup_stats.get("duplicate_lines"), reason_by_case):
             ui.log(f"Review sheet (green = replied, red = needs follow-up): "
                    f"{xlsx.name}")
         else:
@@ -1822,10 +1959,13 @@ def collect_diagnostics(out_path=None):
         for folder in ("logs", "screenshots"):
             base = SCRIPT_DIR / folder
             if base.is_dir():
-                for f in sorted(base.iterdir())[-40:]:
-                    if f.is_file():
-                        z.write(f, arcname=f"{folder}/{f.name}")
-                        added.append(f"{folder}/{f.name}")
+                # newest first: sorting by name could keep last month's
+                # screenshots and drop the ones from the run that just failed
+                files = sorted((f for f in base.iterdir() if f.is_file()),
+                               key=lambda f: f.stat().st_mtime, reverse=True)
+                for f in files[:40]:
+                    z.write(f, arcname=f"{folder}/{f.name}")
+                    added.append(f"{folder}/{f.name}")
         for f in sorted(SCRIPT_DIR.glob("followup_results_*.csv"))[-5:]:
             z.write(f, arcname=f.name)
             added.append(f.name)

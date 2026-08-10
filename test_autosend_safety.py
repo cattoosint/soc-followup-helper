@@ -98,6 +98,71 @@ ts = core.parse_row_time("11:30 PM", NOW)
 check("a time later today is read as yesterday, not the future",
       ts is not None and ts <= NOW, str(ts))
 
+ts = core.parse_row_time("13/8/2026", NOW)
+check("a day above 12 forces day/month order regardless of locale",
+      ts is not None and (ts.day, ts.month) == (13, 8), str(ts))
+
+ts = core.parse_row_time("8/13/2026", NOW)
+check("a month above 12 forces month/day order",
+      ts is not None and (ts.day, ts.month) == (13, 8), str(ts))
+
+check("the machine's own date order is used for ambiguous dates",
+      isinstance(core.date_is_day_first(), bool))
+
+# --- message headers must be recognised whatever the clock ---------------
+print("\n-- 24-hour mailboxes --")
+check("a 24-hour timestamp still marks a line as a message header",
+      core.MSG_TIME_RE.search("AS SOC ALERTS<alerts@example.com> 14:35")
+      is not None)
+check("a 12-hour timestamp still does",
+      core.MSG_TIME_RE.search("AS SOC ALERTS<alerts@example.com> 2:35 PM")
+      is not None)
+
+# --- the draft that gets sent must be the one that was judged ------------
+print("\n-- the send is tied to the case --")
+
+
+class Draft:
+    def __init__(self, subject):
+        self.subject = subject
+        self.sent = False
+
+    def is_displayed(self): return True
+    def is_enabled(self): return True
+    def click(self): self.sent = True
+    @property
+    def text(self): return ""
+    def get_attribute(self, name):
+        return self.subject if name in ("value", "title") else ""
+
+
+class ComposePage:
+    def __init__(self, subject):
+        self.subject_el = Draft(subject)
+        self.send_el = Draft("Send")
+
+    def find_elements(self, by, sel):
+        if "Subject" in sel or "subject" in sel:
+            return [self.subject_el]
+        if "Send" in sel:
+            return [self.send_el]
+        return []
+
+    def find_element(self, by, sel):
+        found = self.find_elements(by, sel)
+        if found:
+            return found[0]
+        raise Exception("not found")
+
+
+wrong = ComposePage("RE: SOC700099 a different case")
+check("refuses to send a draft belonging to another case",
+      core.click_send(wrong, num="700001") is False and not wrong.send_el.sent)
+
+right = ComposePage("RE: SOC700001 Suspicious login")
+check("sends when the draft is for this case",
+      core.click_send(right, num="700001") is True and right.send_el.sent)
+
 print("\n" + "-" * 72)
 print(f"{len(PASS)} passed, {len(FAIL)} failed")
 if FAIL:

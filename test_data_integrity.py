@@ -84,7 +84,18 @@ out = TMP / "review.xlsx"
 core.write_status_xlsx(p, col, {"700001": "SENT", "700002": "SENT"}, out,
                        stats.get("duplicate_lines"))
 ws = load_workbook(out).active
-rows = [(str(r[0].value), r[-1].value,
+
+
+def status_col(sheet):
+    """Locate the status column by name - a 'Why' column follows it."""
+    for cell in sheet[1]:
+        if str(cell.value).strip().lower() == "follow-up status":
+            return cell.column - 1        # 0-based index into the row tuple
+    return -1
+
+
+sc = status_col(ws)
+rows = [(str(r[0].value), r[sc].value,
          ((r[0].fill.start_color.rgb or "")[-6:] if r[0].fill else ""))
         for r in ws.iter_rows(min_row=2)]
 dup_row = rows[1]
@@ -97,10 +108,34 @@ out2 = TMP / "review2.xlsx"
 core.write_status_xlsx(p, col, {"700001": "SENT_UNVERIFIED"}, out2)
 ws2 = load_workbook(out2).active
 first = next(ws2.iter_rows(min_row=2))
+sc2 = status_col(ws2)
 check("a reply that could not be confirmed is not shown as plain green",
-      "unconfirmed" in str(first[-1].value).lower()
+      "unconfirmed" in str(first[sc2].value).lower()
       and (first[0].fill.start_color.rgb or "")[-6:] != "C6EFCE",
-      str(first[-1].value))
+      str(first[sc2].value))
+
+# --- the sheet must explain itself ---------------------------------------
+print("\n-- the sheet says why --")
+out3 = TMP / "review3.xlsx"
+core.write_status_xlsx(
+    p, col,
+    {"700001": "NOT_FOUND", "700002": "SKIPPED"}, out3,
+    stats.get("duplicate_lines"),
+    {"700001": "Searched 5 ways - no mail mentions 700001",
+     "700002": "Draft was opened; the analyst skipped it without sending"})
+ws3 = load_workbook(out3).active
+headers3 = [str(c.value) for c in ws3[1]]
+body3 = list(ws3.iter_rows(min_row=2))
+check("there is a 'Why' column after the status",
+      headers3[-2:] == ["Follow-up status", "Why"], str(headers3[-2:]))
+check("a not-found row explains how it searched",
+      "Searched 5 ways" in str(body3[0][-1].value), str(body3[0][-1].value))
+check("a skipped row explains that the analyst skipped it",
+      "skipped it without sending" in str(body3[2][-1].value),
+      str(body3[2][-1].value))
+check("a duplicate row explains itself too",
+      "earlier in the sheet" in str(body3[1][-1].value),
+      str(body3[1][-1].value))
 
 # --- results survive a mid-run failure -----------------------------------
 print("\n-- results survive a crash --")
