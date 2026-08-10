@@ -53,6 +53,11 @@ class GuiUI:
     def __init__(self, app):
         self.app = app
 
+    def stop_requested(self):
+        """Checked between cases, so Stop works even when auto-send is
+        handling everything and no prompt is ever shown."""
+        return self.app.stop_flag
+
     def log(self, msg):
         core.log.info("[ui] %s", str(msg).strip())
         self.app.events.put(("log", msg))
@@ -114,11 +119,15 @@ class App:
         entry.bind("<Return>", lambda _e: self.load_file())  # paste a path + Enter
         btns_file = ttk.Frame(frm)
         btns_file.grid(row=1, column=1)
-        ttk.Button(btns_file, text="Browse...", command=self.browse).pack(side="left")
-        ttk.Button(btns_file, text="Reload", command=self.load_file).pack(
-            side="left", padx=(4, 0))
-        ttk.Button(btns_file, text="Check export", command=self.check_export).pack(
-            side="left", padx=(4, 0))
+        self.browse_btn = ttk.Button(btns_file, text="Browse...",
+                                     command=self.browse)
+        self.browse_btn.pack(side="left")
+        self.reload_btn = ttk.Button(btns_file, text="Reload",
+                                     command=self.load_file)
+        self.reload_btn.pack(side="left", padx=(4, 0))
+        self.check_btn = ttk.Button(btns_file, text="Check export",
+                                    command=self.check_export)
+        self.check_btn.pack(side="left", padx=(4, 0))
         self.file_info = ttk.Label(frm, text="", foreground="#0066cc")
         self.file_info.grid(row=2, column=0, columnspan=2, sticky="w")
         frm.columnconfigure(0, weight=1)
@@ -216,6 +225,9 @@ class App:
         self.signin_btn = ttk.Button(bar, text="Sign in to Outlook",
                                      command=self.sign_in)
         self.signin_btn.pack(side="left", padx=(8, 0))
+        self.stop_btn = ttk.Button(bar, text="■  Stop", state="disabled",
+                                   command=self.request_stop)
+        self.stop_btn.pack(side="left", padx=(8, 0))
         self.progress_lbl = ttk.Label(bar, text="", font=("Segoe UI", 10, "bold"))
         self.progress_lbl.pack(side="left", padx=16)
         ttk.Button(bar, text="Open output folder",
@@ -271,9 +283,34 @@ class App:
                                font=("Consolas", 9), wrap="word")
         self.log_txt.pack(fill="x", padx=8, pady=(0, 8))
 
+        self.running = False
+        self.stop_flag = False
+        root.protocol("WM_DELETE_WINDOW", self.on_close)
         root.after(100, self.poll)
 
     # ------------------------------------------------------------- callbacks
+
+    def set_inputs_enabled(self, enabled):
+        """Lock the file controls while a run is in progress - changing the
+        sheet mid-run would leave the tracker describing a different list."""
+        state = "normal" if enabled else "disabled"
+        for widget in (self.browse_btn, self.reload_btn, self.check_btn):
+            try:
+                widget.config(state=state)
+            except Exception:
+                pass
+
+    def on_close(self):
+        """Closing mid-run would strand the browser and bin the results."""
+        if self.running:
+            if not messagebox.askokcancel(
+                    "Run in progress",
+                    "A run is still going.\n\nClose anyway? The browser will "
+                    "be left open and results for the remaining cases will "
+                    "not be written.\n\nUse Stop first to finish cleanly."):
+                return
+            core.log.warning("window closed during a run")
+        self.root.destroy()
 
     def browse(self):
         path = filedialog.askopenfilename(
@@ -457,8 +494,12 @@ class App:
                             "auto_sender": opts.auto_sender,
                             "auto_keyword": opts.auto_keyword})
         self.fill_table(cases)
+        self.stop_flag = False
+        self.running = True
         self.start_btn.config(state="disabled")
         self.signin_btn.config(state="disabled")
+        self.stop_btn.config(state="normal")
+        self.set_inputs_enabled(False)
         self.log(f"Starting: {len(cases)} case(s)")
         ui = GuiUI(self)
         src, col = self.file_var.get(), self.column
@@ -529,10 +570,20 @@ class App:
             messagebox.showinfo("Run finished", "\n".join(detail))
 
     def answer(self, key):
+        if key == "q":
+            self.stop_flag = True          # also stops a prompt-free auto-send run
+            self.prompt_lbl.config(text="Stopping after this case...")
         for b in self.buttons.values():
             b.config(state="disabled")
-        self.prompt_lbl.config(text="")
+        if key != "q":
+            self.prompt_lbl.config(text="")
         self.answer_q.put(key)
+
+    def request_stop(self):
+        """Stop button while a run is going but no prompt is showing."""
+        self.stop_flag = True
+        self.log("Stop requested - finishing the current case.")
+        self.prompt_lbl.config(text="Stopping after this case...")
 
     # ---------------------------------------------------------------- events
 
@@ -576,31 +627,50 @@ class App:
                      state="normal" if key in choices else "disabled")
 
     def poll(self):
+        # One bad event must not kill the pump: the worker thread blocks on
+        # answers delivered from here, so a dead pump means a run frozen
+        # forever with no way to stop it.
         try:
             while True:
-                ev = self.events.get_nowait()
-                kind = ev[0]
-                if kind == "log":
-                    self.log(ev[1])
-                elif kind == "case":
-                    self.update_case(ev[1], ev[2], ev[3])
-                elif kind == "ask":
-                    self.show_ask(ev[1], ev[2], ev[3] if len(ev) > 3 else None)
-                elif kind == "clear_ask":
-                    for b in self.buttons.values():
-                        b.config(state="disabled")
-                    self.prompt_lbl.config(text="")
-                elif kind == "summary":
-                    self.show_summary(ev[1])
-                elif kind == "done":
-                    self.start_btn.config(state="normal")
-                    self.signin_btn.config(state="normal")
-                    if not self.prompt_lbl.cget("text"):
-                        self.prompt_lbl.config(text="Finished — results are "
-                                                    "in the output folder.")
-        except queue.Empty:
-            pass
-        self.root.after(100, self.poll)
+                try:
+                    ev = self.events.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    self.handle_event(ev)
+                except Exception as e:
+                    core.log_exception("GUI event failed", e)
+                    try:
+                        self.log(f"(display error: {e})")
+                    except Exception:
+                        pass
+        finally:
+            self.root.after(100, self.poll)
+
+    def handle_event(self, ev):
+        kind = ev[0]
+        if kind == "log":
+            self.log(ev[1])
+        elif kind == "case":
+            self.update_case(ev[1], ev[2], ev[3])
+        elif kind == "ask":
+            self.show_ask(ev[1], ev[2], ev[3] if len(ev) > 3 else None)
+        elif kind == "clear_ask":
+            for b in self.buttons.values():
+                b.config(state="disabled")
+            self.prompt_lbl.config(text="")
+        elif kind == "summary":
+            self.show_summary(ev[1])
+        elif kind == "done":
+            self.running = False
+            self.stop_flag = False
+            self.start_btn.config(state="normal")
+            self.signin_btn.config(state="normal")
+            self.stop_btn.config(state="disabled")
+            self.set_inputs_enabled(True)
+            if not self.prompt_lbl.cget("text"):
+                self.prompt_lbl.config(text="Finished — results are "
+                                            "in the output folder.")
 
 
 def main():

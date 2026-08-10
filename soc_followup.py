@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """SOC nightshift follow-up helper (core + command line).
 
 Drives Outlook on the web only - the SOC uses OWA, so there is no Outlook
@@ -157,6 +157,25 @@ def log_browser(driver):
 
 # ---------------------------------------------------------------- file input
 
+def _unique_headers(headers):
+    """Make repeated column names distinct.
+
+    Exports sometimes carry the same heading twice. Zipping them into a
+    dict would silently keep only the last one, so the tool could read
+    case numbers from the wrong column.
+    """
+    seen, out = {}, []
+    for i, h in enumerate(headers):
+        name = str(h).strip() if h is not None and str(h).strip() else f"column{i + 1}"
+        if name in seen:
+            seen[name] += 1
+            name = f"{name} ({seen[name]})"
+        else:
+            seen[name] = 1
+        out.append(name)
+    return out
+
+
 def read_csv_rows(path, stats=None):
     """Read a .csv or .xlsx file into (headers, list-of-dict-rows).
 
@@ -192,21 +211,35 @@ def read_csv_rows(path, stats=None):
             stats["line_numbers"] = line_numbers[1:]   # drop the heading row
         if not data:
             return [], []
-        headers = data[0]
+        headers = _unique_headers(data[0])
         rows = [dict(zip(headers, r)) for r in data[1:]]
         return headers, rows
+    source = path
     try:
-        f = open(path, "r", encoding="utf-8-sig", newline="")
+        open(path, "rb").close()
     except PermissionError:
         import shutil
         import tempfile
-        tmp = Path(tempfile.gettempdir()) / f"_soc_followup_{path.name}"
-        shutil.copy2(path, tmp)
-        f = open(tmp, "r", encoding="utf-8-sig", newline="")
-    with f:
-        reader = csv.DictReader(f)
-        rows = [row for row in reader]
-        headers = reader.fieldnames or []
+        source = Path(tempfile.gettempdir()) / f"_soc_followup_{path.name}"
+        shutil.copy2(path, source)
+
+    # Excel writes CSV in the local codepage, not UTF-8, so a name with an
+    # accent in it would otherwise make the whole export unreadable
+    rows, headers = [], []
+    for encoding in ("utf-8-sig", "cp1252", "latin-1"):
+        try:
+            with open(source, "r", encoding=encoding, newline="") as f:
+                reader = csv.DictReader(f)
+                rows = [row for row in reader]
+                headers = reader.fieldnames or []
+            if encoding != "utf-8-sig":
+                log.info("read %s as %s", path.name, encoding)
+            break
+        except UnicodeDecodeError:
+            continue
+    headers = _unique_headers(headers)
+    rows = [{h: r.get(o) for h, o in zip(headers, r.keys())} for r in rows] \
+        if rows and len(headers) == len(rows[0]) else rows
     if stats is not None:
         stats["hidden_skipped"] = 0
         stats["line_numbers"] = list(range(2, len(rows) + 2))
@@ -216,6 +249,7 @@ def read_csv_rows(path, stats=None):
 def detect_case_column(headers, rows):
     """Pick the column most likely to hold case numbers."""
     best_col, best_score = None, 0.0
+    total = len(rows) or 1
     for col in headers:
         if not col:
             continue
@@ -224,7 +258,10 @@ def detect_case_column(headers, rows):
         if not values:
             continue
         hits = sum(1 for v in values if CASE_NUM_RE.search(v))
-        frac = hits / len(values)
+        # score against EVERY row, not just the filled ones - otherwise a
+        # column with two stray numbers and 300 blanks scores a perfect 1.0
+        # and beats the real id column
+        frac = hits / total
         named_like_a_case = any(h in col.lower() for h in COLUMN_HINTS)
         bonus = 0.5 if named_like_a_case else 0.0
         # A column called "Case ID" counts even if some rows are unparseable -
@@ -254,7 +291,7 @@ def extract_cases(path, column=None, stats=None):
                 f"Available columns: {', '.join(headers)}"
             )
     cases, seen = [], set()
-    unreadable, duplicates = [], []
+    unreadable, duplicates, blanks = [], [], []
     # report the row numbers Excel shows, which skip over filtered-out rows
     line_numbers = (stats or {}).get("line_numbers") or \
         list(range(2, len(rows) + 2))
@@ -262,8 +299,10 @@ def extract_cases(path, column=None, stats=None):
         raw = str(row.get(column) or "").strip()
         m = CASE_NUM_RE.search(raw)
         if not m:
-            if raw:                             # blank rows aren't a problem
+            if raw:
                 unreadable.append((i, raw[:40]))
+            else:
+                blanks.append(i)                # empty cell - still a dropped row
             continue
         if m.group(0) in seen:
             duplicates.append((i, m.group(0)))
@@ -274,6 +313,8 @@ def extract_cases(path, column=None, stats=None):
         stats["rows_read"] = len(rows)
         stats["unreadable"] = unreadable        # rows that hold no case number
         stats["duplicates"] = duplicates
+        stats["blanks"] = blanks
+        stats["duplicate_lines"] = {i for i, _ in duplicates}
     return column, cases
 
 
@@ -296,6 +337,8 @@ def preflight(path, column=None):
         "hidden_skipped": stats.get("hidden_skipped", 0),
         "unreadable": stats.get("unreadable", []),
         "duplicates": stats.get("duplicates", []),
+        "blanks": stats.get("blanks", []),
+        "duplicate_lines": stats.get("duplicate_lines", set()),
         "header_is_data": header_is_data,
     }
 
@@ -311,6 +354,9 @@ def format_preflight(report):
         out.append(f"Duplicates ignored : {len(report['duplicates'])} "
                    f"(e.g. row {report['duplicates'][0][0]}: "
                    f"{report['duplicates'][0][1]})")
+    if report.get("blanks"):
+        out.append(f"Blank case cells   : {len(report['blanks'])} row(s) "
+                   f"(e.g. row {report['blanks'][0]}) - ignored")
     if report["unreadable"]:
         out.append(f"!! NO CASE NUMBER FOUND in {len(report['unreadable'])} row(s) "
                    "- these will be IGNORED:")
@@ -1050,9 +1096,13 @@ def _click_folder(page, name):
     return False
 
 
-def verify_sent_web(page, num, ui):
+def verify_sent_web(page, num, ui, since=None):
     """After the draft closed, look for the reply in Sent Items.
-    True = found, False = definitely not there, None = couldn't check."""
+
+    `since` is when this send happened: a reply older than that belongs to
+    an earlier run, and counting it would confirm a send that never left.
+    True = found, False = definitely not there, None = couldn't check.
+    """
     if not _click_folder(page, "Sent Items"):
         return None
     try:
@@ -1065,10 +1115,18 @@ def verify_sent_web(page, num, ui):
             # matches leftover search suggestions, which would "verify" a
             # reply that was never sent
             for it in _visible_results(page)[:12]:
-                if label_matches_case(label_of(it), num):
-                    log.debug("sent-items hit for %s on attempt %d",
-                              num, attempt + 1)
-                    return True
+                label = label_of(it)
+                if not label_matches_case(label, num):
+                    continue
+                if since is not None:
+                    stamp = parse_row_time(label)
+                    if stamp is not None and stamp < since - timedelta(minutes=5):
+                        log.debug("ignoring an older reply for %s (%s)",
+                                  num, stamp)
+                        continue        # a reply from a previous run
+                log.debug("sent-items hit for %s on attempt %d",
+                          num, attempt + 1)
+                return True
             if attempt == 3:
                 _click_folder(page, "Inbox")     # force the list to refresh
                 time.sleep(0.6)
@@ -1112,23 +1170,35 @@ def screenshot(page, shots_dir, name):
 # Row colours in the review sheet: done vs still needs a human.
 STATUS_STYLE = {
     "SENT":       ("Replied",        "C6EFCE"),   # green
+    "SENT_UNVERIFIED": ("Replied (unconfirmed)", "FFEB9C"),   # amber
     "SKIPPED":    ("Skipped",        "FFEB9C"),   # amber
     "NOT_FOUND":  ("NOT FOUND",      "FFC7CE"),   # red
     "ERROR":      ("ERROR",          "FFC7CE"),   # red
     "QUIT":       ("Stopped",        "E7E6E6"),   # grey
+    "DUPLICATE":  ("Duplicate row",  "E7E6E6"),   # grey
     "PENDING":    ("Not done yet",   "FFF2CC"),   # pale yellow
 }
 
 
-def write_status_xlsx(src_path, column, status_by_case, out_path):
+def write_status_xlsx(src_path, column, status_by_case, out_path,
+                      duplicate_lines=None):
     """Copy the input sheet, add a status column and colour every row:
-    green = replied, red = still needs a human, yellow = not done yet."""
+    green = replied, red = still needs a human, yellow = not done yet.
+
+    duplicate_lines marks rows repeating a case handled further up, so a
+    second row for the same case is not painted as though it were replied
+    to in its own right.
+    """
     try:
         from openpyxl import Workbook
         from openpyxl.styles import Font, PatternFill
     except ImportError:
+        log.warning("openpyxl missing - no review sheet written")
         return None
-    headers, rows = read_csv_rows(src_path)
+    duplicate_lines = duplicate_lines or set()
+    stats = {}
+    headers, rows = read_csv_rows(src_path, stats)
+    line_numbers = stats.get("line_numbers") or list(range(2, len(rows) + 2))
     wb = Workbook()
     ws = wb.active
     ws.title = "follow-up"
@@ -1136,10 +1206,13 @@ def write_status_xlsx(src_path, column, status_by_case, out_path):
     for cell in ws[1]:
         cell.font = Font(bold=True)
 
-    for row in rows:
+    for row, line in zip(rows, line_numbers):
         ws.append([row.get(h, "") for h in headers])
         m = CASE_NUM_RE.search(str(row.get(column) or ""))
-        status = status_by_case.get(m.group(0), "PENDING") if m else "PENDING"
+        if line in duplicate_lines:
+            status = "DUPLICATE"
+        else:
+            status = status_by_case.get(m.group(0), "PENDING") if m else "PENDING"
         text, colour = STATUS_STYLE.get(status, STATUS_STYLE["PENDING"])
         ws.cell(row=ws.max_row, column=len(headers) + 1, value=text)
         fill = PatternFill(start_color=colour, end_color=colour, fill_type="solid")
@@ -1236,8 +1309,9 @@ def process_case(page, num, opts, shots_dir, ui):
                       "screenshot: %s - leaving the draft for review", shot)
             ui.log("    Couldn't press Send - review this one by hand.")
         else:
+            sent_at = datetime.now()
             time.sleep(2.5)
-            verified = verify_sent_web(page, num, ui)
+            verified = verify_sent_web(page, num, ui, since=sent_at)
             log.info("auto-sent %s; sent-items check: %s", num, verified)
             if verified is False:
                 ui.log("    !!! Sent, but not found in Sent Items - check it.")
@@ -1552,10 +1626,21 @@ def _launch_browser(opts, ui=None):
     return driver
 
 
-def _case_loop(cases, opts, ui, run_one, on_error=None):
-    """Shared per-case loop: bookkeeping, not-found pauses, quit handling."""
-    results = []
+def _case_loop(cases, opts, ui, run_one, on_error=None, results=None):
+    """Shared per-case loop: bookkeeping, not-found pauses, quit handling.
+
+    `results` may be a caller-owned list so finished cases survive even if
+    the run blows up part way through.
+    """
+    results = results if results is not None else []
     for i, num in enumerate(cases, 1):
+        # auto-send can carry a whole run without ever showing a prompt, so
+        # check for a stop request between cases or Stop would be unusable
+        stop = getattr(ui, "stop_requested", None)
+        if callable(stop) and stop():
+            ui.log("    Stopping at user request.")
+            log.info("run stopped by the analyst after %d case(s)", len(results))
+            break
         ui.log(f"[{i}/{len(cases)}] SOC{num}")
         _notify(ui, num, "WORKING")
         try:
@@ -1588,7 +1673,7 @@ def _case_loop(cases, opts, ui, run_one, on_error=None):
     return results
 
 
-def _run_web(cases, opts, ui):
+def _run_web(cases, opts, ui, results=None):
     shots_dir = SCRIPT_DIR / "screenshots"
     log.info("run starting: %d case(s), url=%s, engine=%s, monitor=%s, "
              "settle=%ss, send_delay=%ss, pause_on_notfound=%s",
@@ -1610,6 +1695,7 @@ def _run_web(cases, opts, ui):
             cases, opts, ui,
             run_one=lambda num: process_case(driver, num, opts, shots_dir, ui),
             on_error=lambda num: screenshot(driver, shots_dir, f"case_{num}_error"),
+            results=results,
         )
     finally:
         try:
@@ -1649,7 +1735,20 @@ def run_followups(src_path, column, cases, opts, ui):
     """Run every case, then write the result files. Returns a summary."""
     setup_logging()          # no-op if the caller already started logging
     log.info("input sheet   : %s (column %r)", src_path, column)
-    results = _run_web(cases, opts, ui)
+
+    # An hour of a night shift can sit in these results, so a failure after
+    # the loop - a browser dying, the profile vanishing - must not throw
+    # them away. Whatever was finished still gets written and reported.
+    collected = []
+    run_error = None
+    try:
+        collected = _run_web(cases, opts, ui, collected)
+    except Exception as e:
+        run_error = e
+        log_exception("run stopped early", e)
+        ui.log(f"    !!! Run stopped: {e}")
+        ui.log(f"    Keeping the {len(collected)} case(s) already done.")
+    results = collected
 
 
     stamp = f"{datetime.now():%Y%m%d_%H%M%S}"
@@ -1677,9 +1776,21 @@ def run_followups(src_path, column, cases, opts, ui):
     # Colour-coded copy of the analyst's own sheet: green = replied,
     # red = still needs a human, yellow = never got to it.
     xlsx = SCRIPT_DIR / f"followup_review_{stamp}.xlsx"
-    status_by_case = {r["case"].replace("SOC", ""): r["status"] for r in results}
+    status_by_case = {}
+    for r in results:
+        num = r["case"].replace("SOC", "")
+        status = r["status"]
+        if status == "SENT" and "not verified" in r["detail"]:
+            status = "SENT_UNVERIFIED"      # replied, but we could not confirm
+        status_by_case[num] = status
+    dup_stats = {}
     try:
-        if write_status_xlsx(src_path, column, status_by_case, xlsx):
+        extract_cases(src_path, column, dup_stats)
+    except Exception:
+        pass
+    try:
+        if write_status_xlsx(src_path, column, status_by_case, xlsx,
+                             dup_stats.get("duplicate_lines")):
             ui.log(f"Review sheet (green = replied, red = needs follow-up): "
                    f"{xlsx.name}")
         else:
