@@ -1,0 +1,14 @@
+# Signed-in Chrome session - treat as credential material
+uc_profile/
+profile/
+
+# Site-specific settings: holds the auto-send sender address
+soc_settings.json
+
+# Run output
+bin/
+logs/
+screenshots/
+followup_results_*.csv
+followup_review_*.xlsx
+*.exe

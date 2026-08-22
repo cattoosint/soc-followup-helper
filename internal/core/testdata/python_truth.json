@@ -1,0 +1,467 @@
+{
+  "now": "2026-08-09T20:00:00",
+  "sender_part": [
+    {
+      "header": "",
+      "sender": ""
+    },
+    {
+      "header": "   ",
+      "sender": ""
+    },
+    {
+      "header": "AS ISS SOC ALERTS<alerts@example.com>   To:Analyst Wed 8/5/2026 1:10 PM",
+      "sender": "AS ISS SOC ALERTS<alerts@example.com>"
+    },
+    {
+      "header": "From: SOC Alerts <alerts@example.com> Sent: Wed 8/6/2026",
+      "sender": ""
+    },
+    {
+      "header": "Jane Colleague Thu 8/7/2026 10:15 AM FYI - From: SOC Alerts <alerts@example.com> Sent: Wed 8/6/2026 To: Jane Subject: SOC700001",
+      "sender": "Jane Colleague Thu"
+    },
+    {
+      "header": "Jane Colleague to: alerts@example.com Thu 8/7/2026 10:15 AM",
+      "sender": "Jane Colleague"
+    },
+    {
+      "header": "AS ISS SOC ALERTS<alerts@example.com> Wed 8/5/2026 1:10 PM Please follow up - regards, Jane Colleague",
+      "sender": "AS ISS SOC ALERTS<alerts@example.com> Wed"
+    },
+    {
+      "header": "SOC Alerts 14:35",
+      "sender": "SOC Alerts"
+    },
+    {
+      "header": "SOC Alerts 2:35 PM",
+      "sender": "SOC Alerts"
+    },
+    {
+      "header": "Cc: someone",
+      "sender": ""
+    },
+    {
+      "header": "Bcc: someone",
+      "sender": ""
+    },
+    {
+      "header": "Subject: SOC700001",
+      "sender": ""
+    },
+    {
+      "header": "Jordan Lee <jordan@example.com> To: SOC Team Yesterday 11:30 PM",
+      "sender": "Jordan Lee <jordan@example.com>"
+    },
+    {
+      "header": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA 1:10 PM",
+      "sender": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    },
+    {
+      "header": "SOC Alerts",
+      "sender": "SOC Alerts"
+    },
+    {
+      "header": "SOC Alerts <alerts@example.com> 1:10 PM",
+      "sender": "SOC Alerts <alerts@example.com>"
+    }
+  ],
+  "normalize_text": [
+    {
+      "in": "",
+      "out": ""
+    },
+    {
+      "in": "  Follow Up  ",
+      "out": "followup"
+    },
+    {
+      "in": "SOC Alerts",
+      "out": "socalerts"
+    },
+    {
+      "in": "alerts@ example.com",
+      "out": "alerts@example.com"
+    },
+    {
+      "in": "icon",
+      "out": "icon"
+    },
+    {
+      "in": "zero​width",
+      "out": "zerowidth"
+    },
+    {
+      "in": "nb sp",
+      "out": "nbsp"
+    },
+    {
+      "in": "MiXeD CaSe",
+      "out": "mixedcase"
+    },
+    {
+      "in": "tab\tand\nnewline",
+      "out": "tabandnewline"
+    }
+  ],
+  "label_matches_case": [
+    {
+      "label": "RE: SOC610529 Suspicious login",
+      "num": "610529",
+      "match": true
+    },
+    {
+      "label": "[CLOSED] [SOC#610529] alert",
+      "num": "610529",
+      "match": true
+    },
+    {
+      "label": "SOC-610529 follow up",
+      "num": "610529",
+      "match": true
+    },
+    {
+      "label": "RE: SOC1610529 different case",
+      "num": "610529",
+      "match": false
+    },
+    {
+      "label": "RE: SOC6105290 different case",
+      "num": "610529",
+      "match": false
+    },
+    {
+      "label": "SOC1610529 quoted, real one is SOC610529",
+      "num": "610529",
+      "match": true
+    },
+    {
+      "label": "",
+      "num": "610529",
+      "match": false
+    },
+    {
+      "label": "610529",
+      "num": "610529",
+      "match": true
+    }
+  ],
+  "parse_row_time_day_first": [
+    {
+      "label": "",
+      "stamp": ""
+    },
+    {
+      "label": "7:34 PM",
+      "stamp": "2026-08-09T19:34:00"
+    },
+    {
+      "label": "14:35",
+      "stamp": "2026-08-09T14:35:00"
+    },
+    {
+      "label": "11:30 PM",
+      "stamp": "2026-08-08T23:30:00"
+    },
+    {
+      "label": "12:00 AM",
+      "stamp": "2026-08-09T00:00:00"
+    },
+    {
+      "label": "12:30 PM",
+      "stamp": "2026-08-09T12:30:00"
+    },
+    {
+      "label": "Today 9:15 AM",
+      "stamp": "2026-08-09T09:15:00"
+    },
+    {
+      "label": "Yesterday 11:30 PM",
+      "stamp": "2026-08-08T23:30:00"
+    },
+    {
+      "label": "Mon 3:12 PM",
+      "stamp": "2026-08-03T15:12:00"
+    },
+    {
+      "label": "Sun 9:15 AM",
+      "stamp": "2026-08-02T09:15:00"
+    },
+    {
+      "label": "Sat 7/11",
+      "stamp": "2025-11-07T00:00:00"
+    },
+    {
+      "label": "Tues 4:05 PM",
+      "stamp": "2026-08-04T16:05:00"
+    },
+    {
+      "label": "Thurs 8:00 AM",
+      "stamp": "2026-08-06T08:00:00"
+    },
+    {
+      "label": "Monitoring alert 9:15 AM",
+      "stamp": "2026-08-09T09:15:00"
+    },
+    {
+      "label": "Satellite feed 9:15 AM",
+      "stamp": "2026-08-09T09:15:00"
+    },
+    {
+      "label": "Wedge 9:15 AM",
+      "stamp": "2026-08-09T09:15:00"
+    },
+    {
+      "label": "13/8/2026",
+      "stamp": "2026-08-13T00:00:00"
+    },
+    {
+      "label": "8/13/2026",
+      "stamp": "2026-08-13T00:00:00"
+    },
+    {
+      "label": "10/8/2026",
+      "stamp": "2026-08-10T00:00:00"
+    },
+    {
+      "label": "7/4/2026",
+      "stamp": "2026-04-07T00:00:00"
+    },
+    {
+      "label": "1/1/26",
+      "stamp": "2026-01-01T00:00:00"
+    },
+    {
+      "label": "29/2/2025",
+      "stamp": ""
+    },
+    {
+      "label": "31/4/2026",
+      "stamp": ""
+    },
+    {
+      "label": "2/30",
+      "stamp": ""
+    },
+    {
+      "label": "Re: your ticket",
+      "stamp": ""
+    },
+    {
+      "label": "SOC Alerts",
+      "stamp": ""
+    },
+    {
+      "label": "SOC610529 alert 5:00 AM",
+      "stamp": "2026-08-09T05:00:00"
+    }
+  ],
+  "parse_row_time_month_first": [
+    {
+      "label": "",
+      "stamp": ""
+    },
+    {
+      "label": "7:34 PM",
+      "stamp": "2026-08-09T19:34:00"
+    },
+    {
+      "label": "14:35",
+      "stamp": "2026-08-09T14:35:00"
+    },
+    {
+      "label": "11:30 PM",
+      "stamp": "2026-08-08T23:30:00"
+    },
+    {
+      "label": "12:00 AM",
+      "stamp": "2026-08-09T00:00:00"
+    },
+    {
+      "label": "12:30 PM",
+      "stamp": "2026-08-09T12:30:00"
+    },
+    {
+      "label": "Today 9:15 AM",
+      "stamp": "2026-08-09T09:15:00"
+    },
+    {
+      "label": "Yesterday 11:30 PM",
+      "stamp": "2026-08-08T23:30:00"
+    },
+    {
+      "label": "Mon 3:12 PM",
+      "stamp": "2026-08-03T15:12:00"
+    },
+    {
+      "label": "Sun 9:15 AM",
+      "stamp": "2026-08-02T09:15:00"
+    },
+    {
+      "label": "Sat 7/11",
+      "stamp": "2026-07-11T00:00:00"
+    },
+    {
+      "label": "Tues 4:05 PM",
+      "stamp": "2026-08-04T16:05:00"
+    },
+    {
+      "label": "Thurs 8:00 AM",
+      "stamp": "2026-08-06T08:00:00"
+    },
+    {
+      "label": "Monitoring alert 9:15 AM",
+      "stamp": "2026-08-09T09:15:00"
+    },
+    {
+      "label": "Satellite feed 9:15 AM",
+      "stamp": "2026-08-09T09:15:00"
+    },
+    {
+      "label": "Wedge 9:15 AM",
+      "stamp": "2026-08-09T09:15:00"
+    },
+    {
+      "label": "13/8/2026",
+      "stamp": "2026-08-13T00:00:00"
+    },
+    {
+      "label": "8/13/2026",
+      "stamp": "2026-08-13T00:00:00"
+    },
+    {
+      "label": "10/8/2026",
+      "stamp": "2026-10-08T00:00:00"
+    },
+    {
+      "label": "7/4/2026",
+      "stamp": "2026-07-04T00:00:00"
+    },
+    {
+      "label": "1/1/26",
+      "stamp": "2026-01-01T00:00:00"
+    },
+    {
+      "label": "29/2/2025",
+      "stamp": ""
+    },
+    {
+      "label": "31/4/2026",
+      "stamp": ""
+    },
+    {
+      "label": "2/30",
+      "stamp": ""
+    },
+    {
+      "label": "Re: your ticket",
+      "stamp": ""
+    },
+    {
+      "label": "SOC Alerts",
+      "stamp": ""
+    },
+    {
+      "label": "SOC610529 alert 5:00 AM",
+      "stamp": "2026-08-09T05:00:00"
+    }
+  ],
+  "build_queries": {
+    "610529": [
+      "SOC610529",
+      "SOC 610529",
+      "610529",
+      "subject:SOC610529",
+      "subject:\"SOC 610529\""
+    ],
+    "700001": [
+      "SOC700001",
+      "SOC 700001",
+      "700001",
+      "subject:SOC700001",
+      "subject:\"SOC 700001\""
+    ]
+  },
+  "should_auto_send": [
+    {
+      "header": "AS ISS SOC ALERTS<alerts@example.com> 1:10 PM",
+      "body": "Please follow up on this case.",
+      "keyword": "follow up",
+      "sender": "alerts@example.com",
+      "send": true,
+      "why": "matched 'follow up'; latest mail is from 'alerts@example.com'"
+    },
+    {
+      "header": "Jane Colleague 1:10 PM",
+      "body": "Please follow up.",
+      "keyword": "follow up",
+      "sender": "alerts@example.com",
+      "send": false,
+      "why": "latest mail is not from 'alerts@example.com' (saw 'Jane Colleague 1:10 PM')"
+    },
+    {
+      "header": "AS ISS SOC ALERTS<alerts@example.com> 1:10 PM",
+      "body": "Nothing to see.",
+      "keyword": "follow up",
+      "sender": "alerts@example.com",
+      "send": false,
+      "why": "'follow up' not in the message"
+    },
+    {
+      "header": "AS ISS SOC ALERTS<alerts@example.com> 1:10 PM",
+      "body": "Please follow up.",
+      "keyword": "",
+      "sender": "alerts@example.com",
+      "send": false,
+      "why": "auto-send needs both a phrase and a sender configured"
+    },
+    {
+      "header": "AS ISS SOC ALERTS<alerts@example.com> 1:10 PM",
+      "body": "Please follow up.",
+      "keyword": "follow up",
+      "sender": "",
+      "send": false,
+      "why": "auto-send needs both a phrase and a sender configured"
+    },
+    {
+      "header": "AS ISS SOC ALERTS<alerts@example.com> 1:10 PM",
+      "body": "",
+      "keyword": "follow up",
+      "sender": "alerts@example.com",
+      "send": false,
+      "why": "could not read the message"
+    },
+    {
+      "header": "",
+      "body": "Please follow up.",
+      "keyword": "follow up",
+      "sender": "alerts@example.com",
+      "send": false,
+      "why": "could not identify who sent the latest message"
+    },
+    {
+      "header": "AS ISS SOC ALERTS<alerts@example.com> 1:10 PM",
+      "body": "Please follow up.",
+      "keyword": "follow up",
+      "sender": "SOC",
+      "send": false,
+      "why": "the configured sender is too short to match safely - use the full address or display name"
+    },
+    {
+      "header": "AS ISS SOC ALERTS<alerts@ example.com> 1:10 PM",
+      "body": "Please FOLLOW UP.",
+      "keyword": "follow up",
+      "sender": "alerts@example.com",
+      "send": true,
+      "why": "matched 'follow up'; latest mail is from 'alerts@example.com'"
+    },
+    {
+      "header": "Jordan Lee <jordan@example.com> 1:10 PM",
+      "body": "Please follow up.",
+      "keyword": "follow up",
+      "sender": "Jordan Lee",
+      "send": true,
+      "why": "matched 'follow up'; latest mail is from 'Jordan Lee'"
+    }
+  ]
+}

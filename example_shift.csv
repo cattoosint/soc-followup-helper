@@ -1,0 +1,7 @@
+Case ID,Summary,Severity
+SOC610529,Suspicious login from unusual location,High
+SOC700001,Repeated failed authentication,Medium
+SOC700002,Malware detected on endpoint,High
+SOC700002,Malware detected on endpoint,High
+SOC700003,Data transfer to unknown host,Low
+pending assignment,Awaiting triage,Low
